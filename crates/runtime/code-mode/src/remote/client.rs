@@ -433,6 +433,37 @@ impl Drop for Resumed {
     }
 }
 
+fn executed(result: RemoteReply) -> Result<RemoteReply, CodeModeHostError> {
+    match result {
+        Ok(Some(mut value)) => {
+            ReceivedCalls::default().execution(&mut value)?;
+            Ok(Ok(Some(value)))
+        }
+        other => Ok(other),
+    }
+}
+
+fn orphaned(
+    client: Weak<Client>,
+    id: u64,
+    mut replies: mpsc::UnboundedReceiver<(Frame, bool)>,
+) -> HostFuture<'static, ()> {
+    Box::pin(async move {
+        while let Some((frame, from_hand)) = replies.recv().await {
+            let Frame::Reply { result, .. } = frame else {
+                continue;
+            };
+            if from_hand
+                && let Ok(result) = executed(result)
+                && let Some(client) = client.upgrade()
+            {
+                client.settle_reply_behind(id, &result, None);
+            }
+            return;
+        }
+    })
+}
+
 fn resumed(
     client: Weak<Client>,
     id: u64,
@@ -920,6 +951,22 @@ impl Client {
         }
     }
 
+    fn orphan(
+        self: &Arc<Self>,
+        id: u64,
+        waiter: &Waiter,
+    ) -> Option<(Waiter, HostFuture<'static, ()>)> {
+        if self.ledger.is_none() || self.resumes.is_none() {
+            return None;
+        }
+        let (replies, receiver) = mpsc::unbounded_channel();
+        let kept = Waiter {
+            replies,
+            written: Arc::clone(&waiter.written),
+        };
+        Some((kept, orphaned(Arc::downgrade(self), id, receiver)))
+    }
+
     fn adoption(&self, session_id: &str) -> Adoption {
         self.adoptions.update(|adoptions| {
             adoptions
@@ -997,12 +1044,16 @@ impl Client {
         pending: &mut Waiters,
     ) -> Result<Option<HostFuture<'static, ()>>, CodeModeHostError> {
         match frame {
-            Frame::Reply { id, .. } => {
+            Frame::Reply { id, result } => {
                 if let Some(waiter) = pending.remove(&id) {
                     if self.ledger.is_some() && self.resumes.is_some() {
                         self.unacked.update(|unacked| unacked.insert(id));
                     }
-                    let _ = waiter.replies.send((frame, true));
+                    let _ = waiter.replies.send((Frame::Reply { id, result }, true));
+                } else if self.unacked.read(|unacked| unacked.contains(&id))
+                    && let Ok(result) = executed(result)
+                {
+                    self.settle_reply_behind(id, &result, None);
                 }
             }
             Frame::Update { id, .. } => {
@@ -1600,7 +1651,13 @@ async fn drive(
                                 batch.extend(frames);
                             }
                             Some(Outgoing::Forget(id)) => {
-                                pending.remove(&id);
+                                if let Some(waiter) = pending.remove(&id)
+                                    && let Some(client) = client.upgrade()
+                                    && let Some((kept, recorder)) = client.orphan(id, &waiter)
+                                {
+                                    pending.insert(id, kept);
+                                    callbacks.push(recorder);
+                                }
                             }
                             Some(Outgoing::Boundary(frame)) => hold(&mut boundaries, frame),
                         }

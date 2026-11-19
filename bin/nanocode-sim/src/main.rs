@@ -106,6 +106,7 @@ struct Args {
     streams: StreamsMutation,
     hands: HandsMutation,
     fleet: usize,
+    reopen: bool,
     cell_calls: CellCallsMutation,
     long_thread: LongThreadMutation,
     tasks: TasksMutation,
@@ -131,7 +132,7 @@ fn usage() -> ExitCode {
        mpp: [--mutation {}]
        sync: [--mutation {}]
        streams: [--mutation {}]
-       hands: [--mutation {}] [--fleet N]
+       hands: [--mutation {}] [--fleet N] [--reopen]
        cell_calls: [--mutation {}]
        long_thread: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
@@ -201,6 +202,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut streams = StreamsMutation::None;
     let mut hands = HandsMutation::None;
     let mut fleet = 1_usize;
+    let mut reopen = false;
     let mut cell_calls = CellCallsMutation::None;
     let mut long_thread = LongThreadMutation::None;
     let mut tasks = TasksMutation::None;
@@ -233,6 +235,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--state-bytes" => turns.state_bytes = Some(rest.next()?.parse().ok()?),
             "--event-bytes" => turns.event_bytes = Some(rest.next()?.parse().ok()?),
             "--owners" => turns.owners = Some(rest.next()?.parse().ok()?),
+            "--reopen" => reopen = true,
             "--fleet" => {
                 fleet = rest
                     .next()?
@@ -342,6 +345,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         streams,
         hands,
         fleet,
+        reopen,
         cell_calls,
         long_thread,
         tasks,
@@ -374,7 +378,14 @@ fn replay(seed: u64, args: &Args) -> String {
         return streams::replay(seed, args.streams);
     }
     if args.scenario == Scenario::Hands {
-        return hands::replay(seed, args.hands, args.fleet);
+        return hands::replay(
+            seed,
+            args.hands,
+            hands::HandsOptions {
+                fleet: args.fleet,
+                reopen: args.reopen,
+            },
+        );
     }
     if args.scenario == Scenario::CellCalls {
         return cellcalls::replay(seed, args.cell_calls);
@@ -853,7 +864,7 @@ fn main() -> ExitCode {
             Scenario::Hands => hands::judge_seed(
                 seed,
                 args.hands,
-                args.fleet,
+                hands::HandsOptions { fleet: args.fleet, reopen: args.reopen },
                 args.twice,
                 args.options.verbose,
                 &mut hands_totals,
@@ -956,7 +967,7 @@ fn main() -> ExitCode {
             failed,
             args.twice,
             args.hands,
-            args.fleet,
+            hands::HandsOptions { fleet: args.fleet, reopen: args.reopen },
             &hands_totals,
         );
     }

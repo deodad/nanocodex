@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     process::ExitCode,
@@ -66,6 +66,7 @@ const FLEET_MUTATED: usize = 3;
 const CELL_PPM: u64 = 500_000;
 const CELL: &str = "cell";
 const FLEET_COMMIT_MS_MAX: u64 = 200;
+const REOPEN_MS_MAX: u64 = START_MS_MAX + RUN_MS_MAX;
 const UNSENT: [&str; 3] = [
     "not dispatched",
     "never dispatched",
@@ -90,10 +91,11 @@ pub enum HandsMutation {
     FleetSwallowUnsent,
     FleetRedispatch,
     ResumeWaitingOnly,
+    ReopenOrphaned,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -110,6 +112,7 @@ impl HandsMutation {
         Self::FleetSwallowUnsent,
         Self::FleetRedispatch,
         Self::ResumeWaitingOnly,
+        Self::ReopenOrphaned,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -136,6 +139,20 @@ impl HandsMutation {
             Self::FleetSwallowUnsent => "fleet_swallow_unsent",
             Self::FleetRedispatch => "fleet_redispatch",
             Self::ResumeWaitingOnly => "resume_waiting_only",
+            Self::ReopenOrphaned => "reopen_orphaned",
+        }
+    }
+
+    const fn options(self, options: HandsOptions) -> HandsOptions {
+        match self {
+            Self::ReopenOrphaned => HandsOptions {
+                reopen: true,
+                ..options
+            },
+            _ => HandsOptions {
+                fleet: self.fleet(options.fleet),
+                ..options
+            },
         }
     }
 
@@ -163,6 +180,12 @@ impl HandsMutation {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct HandsOptions {
+    pub fleet: usize,
+    pub reopen: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct HandsStats {
     pub seeds: u64,
@@ -176,6 +199,8 @@ pub struct HandsStats {
     pub rode: u64,
     pub replayed: u64,
     pub retained: u64,
+    pub reopened: u64,
+    pub orphaned: u64,
 }
 
 impl HandsStats {
@@ -191,6 +216,8 @@ impl HandsStats {
         self.rode += other.rode;
         self.replayed += other.replayed;
         self.retained += other.retained;
+        self.reopened += other.reopened;
+        self.orphaned += other.orphaned;
     }
 }
 
@@ -202,6 +229,7 @@ struct Script {
     hands: Vec<usize>,
     cells: Vec<bool>,
     schedules: Vec<Schedule>,
+    reopen: Option<u64>,
 }
 
 struct Schedule {
@@ -218,7 +246,16 @@ fn times(rng: &mut Rng, count: u64) -> Vec<u64> {
 }
 
 impl Script {
-    fn of(seed: u64, fleet: usize) -> Self {
+    fn of(seed: u64, options: HandsOptions) -> Self {
+        let mut script = Self::drawn(seed, options.fleet);
+        if options.reopen {
+            let mut rng = Rng::derive(seed, "hands reopen script");
+            script.reopen = Some(rng.range(1, REOPEN_MS_MAX) * MS);
+        }
+        script
+    }
+
+    fn drawn(seed: u64, fleet: usize) -> Self {
         if fleet > 1 {
             return Self::fleet(seed, fleet);
         }
@@ -247,6 +284,7 @@ impl Script {
             hands,
             cells,
             schedules: vec![Schedule { restarts, drops }],
+            reopen: None,
         }
     }
 
@@ -291,6 +329,7 @@ impl Script {
             hands,
             cells,
             schedules,
+            reopen: None,
         }
     }
 
@@ -302,6 +341,10 @@ impl Script {
             self.starts.len(),
             self.crashes.len(),
         );
+        let shape = match self.reopen {
+            Some(at) => format!("{shape} reopen={}", at / MS),
+            None => shape,
+        };
         match self.schedules.len() {
             1 => shape,
             fleet => format!(
@@ -324,6 +367,8 @@ struct Row {
 struct Store {
     rows: Atom<BTreeMap<(String, String), Row>>,
     writes: AtomicU64,
+    abandoned: Atom<BTreeSet<(String, u64)>>,
+    orphaned: AtomicU64,
     seed: u64,
     mutation: HandsMutation,
 }
@@ -355,6 +400,22 @@ impl Store {
         self.rows.update(|rows| {
             rows.insert(at.clone(), row.clone());
         });
+    }
+
+    fn abandon(&self) {
+        let unanswered: Vec<(String, u64)> = self.rows.read(|rows| {
+            rows.values()
+                .filter(|row| row.reply.is_none())
+                .map(|row| (row.key.clone(), row.id))
+                .collect()
+        });
+        self.abandoned
+            .update(|abandoned| abandoned.extend(unanswered.iter().cloned()));
+    }
+
+    fn orphan(&self, key: &str, id: u64) -> bool {
+        self.abandoned
+            .read(|abandoned| abandoned.contains(&(key.to_owned(), id)))
     }
 
     fn recorded(&self, session_id: &str, call_id: &str) -> bool {
@@ -435,6 +496,12 @@ impl HandRequests for Store {
                 return Ok(());
             }
             self.write().await;
+            if self.orphan(key, id) {
+                if self.mutation == HandsMutation::ReopenOrphaned {
+                    return Ok(());
+                }
+                self.orphaned.fetch_add(1, Ordering::Relaxed);
+            }
             self.answer(key, runtime, id, reply);
             Ok(())
         })
@@ -792,6 +859,7 @@ enum Via<'a> {
 }
 
 struct World {
+    reopen: Cell<Option<u64>>,
     script: Script,
     store: Arc<Store>,
     log: Arc<StepHost>,
@@ -916,6 +984,17 @@ impl World {
                 let done = self.now() + self.script.runs[index];
                 hand.running.insert(id, (index, done, value));
                 self.note(format!("{} runs call {index} as request {id}", slot.key));
+            }
+            RemoteFrame::Request {
+                id,
+                operation: RemoteOperation::CancelTurn { .. },
+                ..
+            } if self.script.reopen.is_some() => {
+                let reply = RemoteFrame::Reply {
+                    id,
+                    result: Ok(None),
+                };
+                let _ = out.send(reply.encode(FRAME_BYTES_MAX).expect("fits"));
             }
             RemoteFrame::Ack { ids } => {
                 for id in ids {
@@ -1385,16 +1464,12 @@ fn options(fleet: usize) -> AcceptorOptions {
     }
 }
 
-async fn process(world: &World) {
-    for slot in &world.slots {
-        slot.read.update(BTreeSet::clear);
-    }
+async fn opened(world: &World) -> Arc<OneLog> {
     let host = Arc::clone(&world.log) as Arc<dyn LogHost>;
     let log = OneLog::open(host, SCOPE, policy())
         .await
         .expect("the simulated turn log opens");
     log.settle_durably();
-    let barrier = log.barrier();
     for (index, call) in world.calls.borrow_mut().iter_mut().enumerate() {
         if matches!(call.state, CallState::Admitted) && !durable_step(&world.log, index) {
             world.note(format!("call {index} step was lost; the model asks again"));
@@ -1402,23 +1477,17 @@ async fn process(world: &World) {
             call.state = CallState::Fresh;
         }
     }
-    let (acceptor, _attaches) = Acceptor::new(
-        options(world.slots.len()),
-        Arc::clone(&world.store) as Arc<dyn HandRequests>,
-        |_, _| {
-            Err(Refusal {
-                status: StatusCode::NOT_FOUND,
-                body: String::new(),
-            })
-        },
-    );
+    log
+}
+
+async fn runtime(world: &World, acceptor: &Arc<Acceptor>, log: &Arc<OneLog>) {
+    let barrier = log.barrier();
     if !world.fleet() {
         let route = acceptor.route(Arc::new(|| Box::pin(async { Some(KEY.to_owned()) })));
         let via = Via::Route(&route, &barrier);
         let calls =
-            (0..world.script.starts.len()).map(|index| world.session_call(&via, &log, index));
-        let sessions = nanocode_sync::join_in_order(calls);
-        nanocode_sync::future::join(sessions, world.hand(0, &acceptor)).await;
+            (0..world.script.starts.len()).map(|index| world.session_call(&via, log, index));
+        nanocode_sync::join_in_order(calls).await;
         return;
     }
     let executors = CodeModeExecutors::new();
@@ -1450,11 +1519,53 @@ async fn process(world: &World) {
     };
     primary.route_hands(routed);
     let via = Via::Hands(&hands);
-    let calls = (0..world.script.starts.len()).map(|index| world.session_call(&via, &log, index));
+    let calls = (0..world.script.starts.len()).map(|index| world.session_call(&via, log, index));
     let sessions = nanocode_sync::join_in_order(calls);
+    nanocode_sync::future::join(sessions, world.adopt(&primary)).await;
+}
+
+async fn runtimes(world: &World, acceptor: &Arc<Acceptor>, log: Arc<OneLog>) {
+    let mut log = log;
+    loop {
+        let reopen = world.reopen.take().filter(|at| *at > world.now());
+        let Some(at) = reopen else {
+            runtime(world, acceptor, &log).await;
+            return;
+        };
+        let until = at - world.now();
+        nanocode_sync::select! {
+            () = runtime(world, acceptor, &log) => return,
+            () = world.clock.sleep(Duration::from_nanos(until)) => {}
+        }
+        world.store.abandon();
+        world.stats.borrow_mut().reopened += 1;
+        world.note("the brain drops its runtime and reopens in process".to_owned());
+        drop(log);
+        log = opened(world).await;
+    }
+}
+
+async fn process(world: &World) {
+    for slot in &world.slots {
+        slot.read.update(BTreeSet::clear);
+    }
+    let log = opened(world).await;
+    let (acceptor, _attaches) = Acceptor::new(
+        options(world.slots.len()),
+        Arc::clone(&world.store) as Arc<dyn HandRequests>,
+        |_, _| {
+            Err(Refusal {
+                status: StatusCode::NOT_FOUND,
+                body: String::new(),
+            })
+        },
+    );
     let drivers = (0..world.slots.len()).map(|at| world.hand(at, &acceptor));
-    let work = nanocode_sync::future::join(sessions, nanocode_sync::join_in_order(drivers));
-    nanocode_sync::future::join(work, world.adopt(&primary)).await;
+    nanocode_sync::future::join(
+        runtimes(world, &acceptor, log),
+        nanocode_sync::join_in_order(drivers),
+    )
+    .await;
 }
 
 pub struct HandsOutcome {
@@ -1464,9 +1575,10 @@ pub struct HandsOutcome {
     pub shape: String,
 }
 
-fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
-    let fleet = mutation.fleet(fleet);
-    let script = Script::of(seed, fleet);
+fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsOutcome {
+    let options = mutation.options(options);
+    let fleet = options.fleet;
+    let script = Script::of(seed, options);
     let shape = script.describe();
     let clock = Clock::new();
     crate::host::enter(seed, &clock);
@@ -1501,10 +1613,14 @@ fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
     let store = Arc::new(Store {
         rows: Atom::default(),
         writes: AtomicU64::new(0),
+        abandoned: Atom::default(),
+        orphaned: AtomicU64::new(0),
         seed,
         mutation,
     });
+    let reopen = script.reopen;
     let world = World {
+        reopen: Cell::new(reopen),
         slots,
         script,
         log: Arc::new(StepHost {
@@ -1521,7 +1637,7 @@ fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
         wrong: RefCell::new(Vec::new()),
         stats: RefCell::new(HandsStats {
             seeds: 1,
-            calls: u64::try_from(Script::of(seed, fleet).starts.len()).unwrap_or(u64::MAX),
+            calls: u64::try_from(Script::of(seed, options).starts.len()).unwrap_or(u64::MAX),
             ..HandsStats::default()
         }),
     };
@@ -1560,6 +1676,7 @@ fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
     world.check();
     world.stats.borrow_mut().folded = world.log.folded.load(Ordering::Relaxed);
     world.stats.borrow_mut().rode = world.log.rode.load(Ordering::Relaxed);
+    world.stats.borrow_mut().orphaned = world.store.orphaned.load(Ordering::Relaxed);
     let trace = world.trace.borrow();
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
     for line in trace.iter() {
@@ -1576,8 +1693,8 @@ fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
     }
 }
 
-pub fn run_seed(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
-    std::panic::catch_unwind(|| simulate(seed, mutation, fleet)).unwrap_or_else(|panic| {
+pub fn run_seed(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsOutcome {
+    std::panic::catch_unwind(|| simulate(seed, mutation, options)).unwrap_or_else(|panic| {
         let message = panic
             .downcast_ref::<String>()
             .cloned()
@@ -1595,12 +1712,12 @@ pub fn run_seed(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcom
 pub fn judge_seed(
     seed: u64,
     mutation: HandsMutation,
-    fleet: usize,
+    options: HandsOptions,
     twice: bool,
     verbose: bool,
     totals: &mut HandsStats,
 ) -> Option<String> {
-    let first = run_seed(seed, mutation, fleet);
+    let first = run_seed(seed, mutation, options);
     totals.add(&first.stats);
     if verbose {
         println!("seed {seed} digest {:016x} {}", first.digest, first.shape);
@@ -1610,7 +1727,7 @@ pub fn judge_seed(
             .wrong
             .map(|message| format!("{} :: {message}", first.shape));
     }
-    let second = crate::host::second_pass(|| run_seed(seed, mutation, fleet));
+    let second = crate::host::second_pass(|| run_seed(seed, mutation, options));
     (second.digest != first.digest || second.wrong.is_some()).then(|| {
         format!(
             "{} :: nondeterminism: trace digest {:016x} then {:016x}",
@@ -1619,10 +1736,13 @@ pub fn judge_seed(
     })
 }
 
-pub fn replay(seed: u64, mutation: HandsMutation, fleet: usize) -> String {
+pub fn replay(seed: u64, mutation: HandsMutation, options: HandsOptions) -> String {
     let mut command = format!("nanocode-sim --scenario hands --seed {seed}");
-    if fleet > 1 {
-        command.push_str(&format!(" --fleet {fleet}"));
+    if options.fleet > 1 {
+        command.push_str(&format!(" --fleet {}", options.fleet));
+    }
+    if options.reopen {
+        command.push_str(" --reopen");
     }
     if mutation != HandsMutation::None {
         command.push_str(" --mutation ");
@@ -1637,7 +1757,7 @@ pub fn report(
     failed: u64,
     twice: bool,
     mutation: HandsMutation,
-    fleet: usize,
+    options: HandsOptions,
     totals: &HandsStats,
 ) -> ExitCode {
     println!(
@@ -1645,7 +1765,7 @@ pub fn report(
         seeds.start,
         seeds.end,
         mutation.name(),
-        mutation.fleet(fleet)
+        mutation.options(options).fleet
     );
     match mutation {
         HandsMutation::None if failed == 0 => ExitCode::SUCCESS,
