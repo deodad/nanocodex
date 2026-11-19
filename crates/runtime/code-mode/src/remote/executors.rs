@@ -257,7 +257,13 @@ impl HandCalls for ExecutorCalls {
         Box::pin(async move {
             let state = self.state.upgrade()?;
             let host = state.read(|state| state.executors.get(hand).cloned())?;
-            host.recover_call(context).await.ok().flatten()
+            match host.recover_call(context).await {
+                Ok(output) => output,
+                Err(error) if error.is_unsent() => {
+                    Some(ToolOutput::error(format!("hand `{hand}`: {error}")))
+                }
+                Err(_) => None,
+            }
         })
     }
 }
