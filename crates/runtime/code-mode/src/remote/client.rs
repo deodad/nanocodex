@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     future::{Future, poll_fn},
     pin::pin,
     sync::{
@@ -387,6 +387,7 @@ struct Client {
     caches_local_tools: bool,
     local_tools_keyed: Atom<Option<(Vec<ToolDefinition>, String)>>,
     ledger: Option<Arc<dyn RemoteLedger>>,
+    unacked: Atom<BTreeSet<u64>>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -661,6 +662,7 @@ impl RemoteClient {
             caches_local_tools,
             local_tools_keyed: Atom::default(),
             ledger,
+            unacked: Atom::default(),
             _stop: stop,
         });
         let resumed = receivers
@@ -895,6 +897,7 @@ impl Client {
         };
         match recorded {
             Ok(()) if self.resumes.is_some() => {
+                self.unacked.update(|unacked| unacked.remove(&id));
                 let _ = self.outgoing.send(Outgoing::frames(
                     vec![Frame::Ack { ids: vec![id] }],
                     RemoteDelivery::Immediate,
@@ -984,6 +987,9 @@ impl Client {
         match frame {
             Frame::Reply { id, .. } => {
                 if let Some(waiter) = pending.remove(&id) {
+                    if self.ledger.is_some() && self.resumes.is_some() {
+                        self.unacked.update(|unacked| unacked.insert(id));
+                    }
                     let _ = waiter.replies.send((frame, true));
                 }
             }
@@ -1000,11 +1006,15 @@ impl Client {
                 if !resumable || runtime_id.is_none() || runtime_id != self.resumes {
                     return Err(error(HAND_RESTARTED));
                 }
-                let pending = pending
+                let mut pending: Vec<u64> = pending
                     .iter()
                     .filter(|(_, waiter)| waiter.written.load(Ordering::SeqCst))
                     .map(|(id, _)| *id)
                     .collect();
+                pending.extend(
+                    self.unacked
+                        .read(|unacked| unacked.iter().copied().collect::<Vec<_>>()),
+                );
                 self.outgoing
                     .send(Outgoing::frames(
                         vec![Frame::Resume { pending }],

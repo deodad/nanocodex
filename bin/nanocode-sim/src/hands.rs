@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::Range,
     process::ExitCode,
     rc::Rc,
@@ -86,10 +86,11 @@ pub enum HandsMutation {
     FleetCrossHands,
     FleetRecoverNone,
     FleetSwallowUnsent,
+    ResumeWaitingOnly,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -104,6 +105,7 @@ impl HandsMutation {
         Self::FleetCrossHands,
         Self::FleetRecoverNone,
         Self::FleetSwallowUnsent,
+        Self::ResumeWaitingOnly,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -128,6 +130,7 @@ impl HandsMutation {
             Self::FleetCrossHands => "fleet_cross_hands",
             Self::FleetRecoverNone => "fleet_recover_none",
             Self::FleetSwallowUnsent => "fleet_swallow_unsent",
+            Self::ResumeWaitingOnly => "resume_waiting_only",
         }
     }
 
@@ -655,6 +658,7 @@ struct SimLink {
     incoming: Owned<mpsc::UnboundedReceiver<String>>,
     outgoing: mpsc::UnboundedSender<String>,
     resumes: String,
+    read: Arc<Atom<BTreeSet<u64>>>,
 }
 
 impl RemoteLink for SimLink {
@@ -691,7 +695,15 @@ impl RemoteLink for SimLink {
     fn receive(&self) -> HostFuture<'_, Result<Vec<RemoteFrame>, CodeModeHostError>> {
         Box::pin(async move {
             match self.incoming.acquire().await.recv().await {
-                Some(text) => Ok(vec![RemoteFrame::decode(&text, FRAME_BYTES_MAX)?]),
+                Some(text) => {
+                    let frame = RemoteFrame::decode(&text, FRAME_BYTES_MAX)?;
+                    if let RemoteFrame::Reply { id, .. } = &frame {
+                        self.read.update(|read| {
+                            read.insert(*id);
+                        });
+                    }
+                    Ok(vec![frame])
+                }
                 None => Err(CodeModeHostError::new(PEER_CLOSED)),
             }
         })
@@ -743,6 +755,7 @@ struct Slot {
     hand: RefCell<Hand>,
     restarts: RefCell<Vec<u64>>,
     drops: RefCell<Vec<u64>>,
+    read: Arc<Atom<BTreeSet<u64>>>,
 }
 
 enum Via<'a> {
@@ -879,6 +892,11 @@ impl World {
                 }
             }
             RemoteFrame::Resume { pending } => {
+                let mut pending = pending;
+                if self.store.mutation == HandsMutation::ResumeWaitingOnly {
+                    let read = slot.read.read(BTreeSet::clone);
+                    pending.retain(|id| !(hand.retained.contains_key(id) && read.contains(id)));
+                }
                 hand.retained.retain(|id, _| pending.contains(id));
                 for id in pending {
                     if let Some(value) = hand.retained.get(&id) {
@@ -970,6 +988,7 @@ impl World {
                 incoming: Owned::new(from_hand),
                 outgoing: to_hand,
                 resumes: runtime,
+                read: Arc::clone(&slot.read),
             };
             let brain = async {
                 match acceptor.attach(slot.key.clone(), catalog, link).await {
@@ -1213,6 +1232,9 @@ fn options(fleet: usize) -> AcceptorOptions {
 }
 
 async fn process(world: &World) {
+    for slot in &world.slots {
+        slot.read.update(BTreeSet::clear);
+    }
     let host = Arc::clone(&world.log) as Arc<dyn LogHost>;
     let log = OneLog::open(host, SCOPE, policy())
         .await
@@ -1308,6 +1330,7 @@ fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
             hand: RefCell::new(Hand::default()),
             restarts: RefCell::new(schedule.restarts.clone()),
             drops: RefCell::new(schedule.drops.clone()),
+            read: Arc::default(),
         })
         .collect();
     let crashes = script.crashes.clone();
