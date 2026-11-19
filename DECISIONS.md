@@ -2415,3 +2415,13 @@ Limits: the wait covers every child of the root session, including children an e
 `nanocode_mpp::tempo_id::CLIENT_ID` changes from `cli:nanocode` to `nanocode`. Tempo ID treats every `cli:` client ID as an unregistered CLI, so its device page marked nanocode with a warning icon. tempoxyz/id#1061 seeds `nanocode` as a first-party device app in the `default` realm, so the device page shows nanocode as verified. The device grant, the token poll and the `/fund` deposit link all send the new client ID. Sign-ins saved under `cli:nanocode` keep their signed access key until it expires. Once this release ships, an admin of Tempo ID can block `cli:nanocode`, so no other CLI can claim the name.
 
 `curl -X POST https://id.tempo.xyz/device/code -d 'client_id=nanocode&scope=openid'` returns a device code on 2026-11-19.
+
+## Cancelling a TurnInbox request closes its subagents (2026-11-18)
+
+Once requests wait for their children, cancelling one while a child still runs closed the request but left the child running. When the child finished, the subagent runtime delivered its result as a new root turn that belonged to no request: the root agent was woken to answer a request the user had cancelled, and that turn's events and reply had no owner.
+
+When `drive` ends a request as Cancelled, it now calls `SubagentControl::close_all` for the root session before recording the cancellation, so no child of the cancelled request can wake the root afterwards. Because a request stays open until the root session's children are quiescent, the children running at that point are the cancelled request's. A failure to close them is returned from `drive` and the request stays open for the next call.
+
+Limits: it closes every child of the root session, including any started by the live `turn` entry point. Failed requests do not close their children. No case crashes between the cancel and the close.
+
+The `request_close` scenario's cancel case now releases child B after the cancel, keeps driving until the session settles, and checks that B's result never reaches the root and that no completion-pass event is left without a request. On the base branch this fails all 50 seeds of 1..51; with this change `--seeds 1..51 --twice` passes 50/50 with identical digests, and dropping either the close or the call to it fails seeds 1..3. The store, agents, `turns --policy turnlog`, `runtime --store log` (local and remote children) and `long_thread` scenarios print the same RESULT lines as the base branch over seeds 1..11, `--tidy` prints the same findings, clippy is clean and the `wasm32-unknown-unknown` check passes. Measured on hosted Linux x86_64.

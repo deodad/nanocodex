@@ -1392,6 +1392,9 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             DurableOutcome::Completed(message) => self.children(id, message).await,
             outcome => outcome,
         };
+        if matches!(outcome, DurableOutcome::Cancelled) {
+            self.abandon_children().await?;
+        }
         match outcome {
             DurableOutcome::Completed(message) => {
                 let mut ok = serde_json::json!({"ok": {
@@ -1464,6 +1467,18 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             DurableOutcome::Waiting | DurableOutcome::Interrupted => DurableOutcome::Interrupted,
             _ => DurableOutcome::Completed(message),
         }
+    }
+
+    async fn abandon_children(&self) -> Result<(), InboxError> {
+        let Some(delegates) = self.runtime.delegates() else {
+            return Ok(());
+        };
+        delegates
+            .control()
+            .close_all(self.session_id())
+            .await
+            .map_err(|error| InboxError::Events(format!("closing the request's subagents failed: {error}")))?;
+        Ok(())
     }
 
     fn completion_turns(&self) -> Vec<String> {

@@ -331,7 +331,7 @@ async fn pumped<T>(pump: &mut HostFuture<'static, ()>, work: impl Future<Output 
     .await
 }
 
-async fn serve(process: &Process, first: bool, cancel: bool) -> Result<(), String> {
+async fn serve(process: &Process, wire: &Wire, first: bool, cancel: bool) -> Result<(), String> {
     if first {
         process
             .inbox
@@ -362,6 +362,7 @@ async fn serve(process: &Process, first: bool, cancel: bool) -> Result<(), Strin
                 let answered = inbox.agent().turn_controls().is_empty();
                 if open && answered {
                     drop(inbox.cancel(REQUEST, &serde_json::Map::new()).await);
+                    wire.released.store(true, Ordering::Release);
                     return;
                 }
             }
@@ -371,7 +372,6 @@ async fn serve(process: &Process, first: bool, cancel: bool) -> Result<(), Strin
             nanocode_sync::future::Either::Right(((), drive)) => drive.await,
         };
         driven.map_err(|error| format!("drive: {error}"))?;
-        return Ok(());
     }
     for _ in 0..DRIVES_MAX {
         let driven = process
@@ -491,6 +491,7 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
                     &mut pump,
                     serve(
                         &process,
+                        &wire,
                         number == 0,
                         case == Case::CancelWhileAwaitingChild,
                     ),
@@ -564,6 +565,32 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
         if results != 1 {
             run.wrong.push(format!(
                 "the request recorded {results} results instead of one"
+            ));
+        }
+        let stray = seen
+            .events
+            .iter()
+            .filter(|event| {
+                event
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(COMPLETION_PREFIX))
+            })
+            .count();
+        if stray > 0 {
+            run.wrong.push(format!(
+                "{stray} events of child-completion passes belong to no request after the cancel"
+            ));
+        }
+        let woke = wire
+            .root_calls
+            .get()
+            .iter()
+            .filter(|last| last.contains(RESULT_B))
+            .count();
+        if woke > 0 {
+            run.wrong.push(format!(
+                "after the request was cancelled, child B still woke the root agent in {woke} model calls"
             ));
         }
         return (run, calls);
