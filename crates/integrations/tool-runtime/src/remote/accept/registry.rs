@@ -50,6 +50,8 @@ pub type ResolveKey = Arc<dyn Fn() -> HostFuture<'static, Option<String>> + Send
 
 pub const NOT_CONNECTED: &str =
     "the session's hand has no live socket; the operation was not dispatched";
+pub const STOPPED_UNATTACHED: &str =
+    "the turn was stopped while its hand was not attached; the operation was not dispatched";
 pub const NOT_RECORDED: &str = "no request was recorded for this call, so it was never dispatched";
 pub const NOT_ANSWERED: &str =
     "the hand did not answer the recorded request; its outcome is unknown";
@@ -300,6 +302,42 @@ pub struct Acceptor {
     changes: Arc<Changes>,
     attached: mpsc::Sender<String>,
     bindings: Atom<HashMap<String, Bound>>,
+    stops: Atom<HashMap<String, Stops>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Stops {
+    waiting: usize,
+    count: u64,
+}
+
+struct Waiting<'a> {
+    stops: &'a Atom<HashMap<String, Stops>>,
+    session: String,
+    count: u64,
+}
+
+impl Waiting<'_> {
+    fn stopped(&self) -> bool {
+        self.stops.read(|stops| {
+            stops
+                .get(&self.session)
+                .is_some_and(|stops| stops.count != self.count)
+        })
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.stops.update(|stops| {
+            if let Some(entry) = stops.get_mut(&self.session) {
+                entry.waiting -= 1;
+                if entry.waiting == 0 {
+                    stops.remove(&self.session);
+                }
+            }
+        });
+    }
 }
 
 pub struct Attached {
@@ -383,6 +421,7 @@ impl Acceptor {
             changes,
             attached,
             bindings: Atom::default(),
+            stops: Atom::default(),
         };
         (Arc::new(acceptor), attaches)
     }
@@ -701,6 +740,26 @@ pub struct AcceptorRoute {
     routed: Atom<Option<Arc<dyn HandCalls>>>,
 }
 
+fn worked(operation: &RemoteOperation) -> Option<&str> {
+    match operation {
+        RemoteOperation::Execute { context, .. }
+        | RemoteOperation::Wait { context, .. }
+        | RemoteOperation::Call { context, .. } => Some(&context.session_id),
+        _ => None,
+    }
+}
+
+fn stopping(operation: &RemoteOperation) -> Option<&str> {
+    match operation {
+        RemoteOperation::Cancel { session_id }
+        | RemoteOperation::CancelTurn {
+            session_id,
+            turn_id: None,
+        } => Some(session_id),
+        _ => None,
+    }
+}
+
 impl AcceptorRoute {
     fn key(&self) -> Option<String> {
         if let Some(key) = Option::clone(&self.last.get()) {
@@ -734,6 +793,38 @@ impl AcceptorRoute {
         last.and_then(|key| self.acceptor.live(&key))
             .map(|(client, _)| client)
             .ok_or_else(|| CodeModeHostError::unsent(NOT_CONNECTED))
+    }
+
+    async fn attached(
+        &self,
+        operation: &RemoteOperation,
+    ) -> Result<RemoteClient, CodeModeHostError> {
+        if let Some(session) = stopping(operation) {
+            self.acceptor.stops.update(|stops| {
+                if let Some(entry) = stops.get_mut(session) {
+                    entry.count += 1;
+                }
+            });
+            return self.client().await;
+        }
+        let Some(session) = worked(operation) else {
+            return self.client().await;
+        };
+        let count = self.acceptor.stops.update(|stops| {
+            let entry = stops.entry(session.to_owned()).or_default();
+            entry.waiting += 1;
+            entry.count
+        });
+        let waiting = Waiting {
+            stops: &self.acceptor.stops,
+            session: session.to_owned(),
+            count,
+        };
+        let client = self.client().await?;
+        if waiting.stopped() {
+            return Err(CodeModeHostError::unsent(STOPPED_UNATTACHED));
+        }
+        Ok(client)
     }
 
     async fn client(&self) -> Result<RemoteClient, CodeModeHostError> {
@@ -783,7 +874,7 @@ impl RemoteTransport for AcceptorRoute {
         observer: Option<&'a mut dyn CodeModeObserver>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
         Box::pin(async move {
-            let client = self.client().await?;
+            let client = self.attached(&operation).await?;
             self.unadopt(&operation);
             let observer = observer.map(|observer| observer as &mut dyn CodeModeObserver);
             client.request(operation, local_tools, observer).await
@@ -798,7 +889,7 @@ impl RemoteTransport for AcceptorRoute {
         barrier: Arc<dyn RemoteBarrier>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
         Box::pin(async move {
-            let client = self.client().await?;
+            let client = self.attached(&operation).await?;
             let observer = observer.map(|observer| observer as &mut dyn CodeModeObserver);
             client
                 .request_after(operation, local_tools, observer, barrier)
@@ -807,7 +898,7 @@ impl RemoteTransport for AcceptorRoute {
     }
 
     fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
-        Box::pin(async move { self.client().await?.call(operation).await })
+        Box::pin(async move { self.attached(&operation).await?.call(operation).await })
     }
 
     fn call_after(
@@ -815,7 +906,12 @@ impl RemoteTransport for AcceptorRoute {
         operation: RemoteOperation,
         barrier: Arc<dyn RemoteBarrier>,
     ) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
-        Box::pin(async move { self.client().await?.call_after(operation, barrier).await })
+        Box::pin(async move {
+            self.attached(&operation)
+                .await?
+                .call_after(operation, barrier)
+                .await
+        })
     }
 
     fn recover<'a>(

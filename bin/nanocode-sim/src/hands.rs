@@ -56,6 +56,7 @@ const RESTART_PPM: u64 = 300_000;
 const REDIAL_MS_MAX: u64 = 40;
 const WRITE_MS_MAX: u64 = 3;
 const STALL_EVERY: u64 = 3;
+const CANCELS_MAX: u64 = 6;
 const TICK: Duration = Duration::from_millis(1);
 const GRACE: Duration = Duration::from_secs(5);
 const SETTLE_HORIZON_MS: u64 = 60_000;
@@ -94,10 +95,11 @@ pub enum HandsMutation {
     ResumeWaitingOnly,
     ReopenOrphaned,
     ReopenUnprobed,
+    CancelLate,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -116,6 +118,7 @@ impl HandsMutation {
         Self::ResumeWaitingOnly,
         Self::ReopenOrphaned,
         Self::ReopenUnprobed,
+        Self::CancelLate,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -144,6 +147,7 @@ impl HandsMutation {
             Self::ResumeWaitingOnly => "resume_waiting_only",
             Self::ReopenOrphaned => "reopen_orphaned",
             Self::ReopenUnprobed => "reopen_unprobed",
+            Self::CancelLate => "cancel_late",
         }
     }
 
@@ -151,6 +155,11 @@ impl HandsMutation {
         match self {
             Self::ReopenOrphaned | Self::ReopenUnprobed => HandsOptions {
                 reopen: true,
+                ..options
+            },
+            Self::CancelLate => HandsOptions {
+                fleet: 1,
+                cancel: true,
                 ..options
             },
             _ => HandsOptions {
@@ -188,6 +197,7 @@ impl HandsMutation {
 pub struct HandsOptions {
     pub fleet: usize,
     pub reopen: bool,
+    pub cancel: bool,
 }
 
 #[derive(Debug, Default)]
@@ -206,6 +216,7 @@ pub struct HandsStats {
     pub reopened: u64,
     pub orphaned: u64,
     pub stalled: u64,
+    pub stopped: u64,
 }
 
 impl HandsStats {
@@ -224,6 +235,7 @@ impl HandsStats {
         self.reopened += other.reopened;
         self.orphaned += other.orphaned;
         self.stalled += other.stalled;
+        self.stopped += other.stopped;
     }
 }
 
@@ -236,6 +248,7 @@ struct Script {
     cells: Vec<bool>,
     schedules: Vec<Schedule>,
     reopen: Option<u64>,
+    cancels: Vec<u64>,
 }
 
 struct Schedule {
@@ -257,6 +270,14 @@ impl Script {
         if options.reopen {
             let mut rng = Rng::derive(seed, "hands reopen script");
             script.reopen = Some(rng.range(1, REOPEN_MS_MAX) * MS);
+        }
+        if options.cancel && options.fleet <= 1 {
+            let mut rng = Rng::derive(seed, "hands cancel script");
+            let cancels = rng.range(1, CANCELS_MAX);
+            script.cancels = (0..cancels)
+                .map(|_| rng.range(0, START_MS_MAX) * MS)
+                .collect();
+            script.cancels.sort_unstable();
         }
         script
     }
@@ -291,6 +312,7 @@ impl Script {
             cells,
             schedules: vec![Schedule { restarts, drops }],
             reopen: None,
+            cancels: Vec::new(),
         }
     }
 
@@ -336,6 +358,7 @@ impl Script {
             cells,
             schedules,
             reopen: None,
+            cancels: Vec::new(),
         }
     }
 
@@ -350,6 +373,11 @@ impl Script {
         let shape = match self.reopen {
             Some(at) => format!("{shape} reopen={}", at / MS),
             None => shape,
+        };
+        let shape = if self.cancels.is_empty() {
+            shape
+        } else {
+            format!("{shape} cancels={}", self.cancels.len())
         };
         match self.schedules.len() {
             1 => shape,
@@ -874,13 +902,53 @@ struct Slot {
     read: Arc<Atom<BTreeSet<u64>>>,
 }
 
+struct Waiting<'a> {
+    world: &'a World,
+    token: Option<u64>,
+}
+
+impl<'a> Waiting<'a> {
+    fn enter(world: &'a World, acceptor: &Acceptor, index: usize) -> Self {
+        if world.script.cancels.is_empty() || acceptor.connected(KEY) {
+            return Self { world, token: None };
+        }
+        let token = world.tokens.get();
+        world.tokens.set(token + 1);
+        world
+            .waiting
+            .borrow_mut()
+            .insert(token, (index, world.dials.get()));
+        Self {
+            world,
+            token: Some(token),
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.token
+            .is_some_and(|token| self.world.stopped.borrow().contains(&token))
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token {
+            self.world.waiting.borrow_mut().remove(&token);
+        }
+    }
+}
+
 enum Via<'a> {
-    Route(&'a AcceptorRoute, &'a Arc<dyn RemoteBarrier>),
+    Route(&'a AcceptorRoute, &'a Arc<dyn RemoteBarrier>, &'a Acceptor),
     Hands(&'a Arc<dyn HandCalls>),
 }
 
 struct World {
     reopen: Cell<Option<u64>>,
+    dials: Cell<u64>,
+    waiting: RefCell<BTreeMap<u64, (usize, u64)>>,
+    stopped: RefCell<BTreeSet<u64>>,
+    tokens: Cell<u64>,
     script: Script,
     store: Arc<Store>,
     log: Arc<StepHost>,
@@ -1011,7 +1079,7 @@ impl World {
                 id,
                 operation: RemoteOperation::CancelTurn { .. },
                 ..
-            } if self.script.reopen.is_some() => {
+            } if self.script.reopen.is_some() || !self.script.cancels.is_empty() => {
                 let reply = RemoteFrame::Reply {
                     id,
                     result: Ok(None),
@@ -1209,6 +1277,7 @@ impl World {
                 resumes: runtime,
                 read: Arc::clone(&slot.read),
             };
+            self.dials.set(self.dials.get() + 1);
             let brain = async {
                 {
                     let mut hand = slot.hand.borrow_mut();
@@ -1220,6 +1289,50 @@ impl World {
                 }
             };
             nanocode_sync::future::join(brain, self.connection(at, to_brain, from_brain)).await;
+        }
+    }
+
+    async fn canceller(&self, route: &AcceptorRoute, acceptor: &Acceptor) {
+        for &at in &self.script.cancels {
+            let now = self.now();
+            if at > now {
+                self.clock.sleep(Duration::from_nanos(at - now)).await;
+            }
+            if self.done() {
+                return;
+            }
+            if acceptor.connected(KEY) {
+                continue;
+            }
+            let dials = self.dials.get();
+            let stopped: Vec<(u64, usize)> = self
+                .waiting
+                .borrow()
+                .iter()
+                .filter(|(_, (_, since))| *since == dials)
+                .map(|(token, (index, _))| (*token, *index))
+                .collect();
+            if stopped.is_empty() {
+                continue;
+            }
+            self.stats.borrow_mut().stopped += 1;
+            self.note(format!(
+                "turn stopped while calls {:?} wait for the hand",
+                stopped.iter().map(|(_, index)| *index).collect::<Vec<_>>()
+            ));
+            self.stopped
+                .borrow_mut()
+                .extend(stopped.iter().map(|(token, _)| *token));
+            if self.store.mutation == HandsMutation::CancelLate {
+                while !acceptor.connected(KEY) && !self.done() {
+                    self.clock.sleep(TICK).await;
+                }
+            }
+            let cancel = RemoteOperation::CancelTurn {
+                session_id: SESSION.to_owned(),
+                turn_id: None,
+            };
+            let _ = route.request(cancel, Vec::new(), None).await;
         }
     }
 
@@ -1290,7 +1403,8 @@ impl World {
     async fn dispatch(&self, via: &Via<'_>, index: usize) -> Outcome {
         let call_id = index.to_string();
         match via {
-            Via::Route(route, barrier) => {
+            Via::Route(route, barrier, acceptor) => {
+                let waiting = Waiting::enter(self, acceptor, index);
                 let context =
                     RemoteContext::new(SESSION.to_owned(), call_id, Some(TURN.to_owned()));
                 let operation = RemoteOperation::Call {
@@ -1305,11 +1419,20 @@ impl World {
                 } else {
                     route.call_after(operation, Arc::clone(barrier)).await
                 };
-                match result {
+                let outcome = match result {
                     Ok(value) => Outcome::Value(value),
                     Err(error) if error.is_unsent() => Outcome::NotDispatched,
                     Err(_) => Outcome::Unknown,
+                };
+                if waiting.stopped() && !matches!(outcome, Outcome::NotDispatched) {
+                    self.fail(
+                        "stopped",
+                        format!(
+                            "call {index} waited for an unattached hand while its turn was stopped, then returned {outcome:?}"
+                        ),
+                    );
                 }
+                outcome
             }
             Via::Hands(calls) => {
                 let context =
@@ -1327,7 +1450,7 @@ impl World {
         self.stats.borrow_mut().recovered += 1;
         let call_id = index.to_string();
         match via {
-            Via::Route(route, _) => {
+            Via::Route(route, _, _) => {
                 let context =
                     RemoteContext::new(SESSION.to_owned(), call_id, Some(TURN.to_owned()));
                 let recovered = route
@@ -1511,10 +1634,14 @@ async fn runtime(world: &World, acceptor: &Arc<Acceptor>, log: &Arc<OneLog>) {
     let barrier = log.barrier();
     if !world.fleet() {
         let route = acceptor.route(Arc::new(|| Box::pin(async { Some(KEY.to_owned()) })));
-        let via = Via::Route(&route, &barrier);
+        let via = Via::Route(&route, &barrier, acceptor);
         let calls =
             (0..world.script.starts.len()).map(|index| world.session_call(&via, log, index));
-        nanocode_sync::join_in_order(calls).await;
+        nanocode_sync::future::join(
+            nanocode_sync::join_in_order(calls),
+            world.canceller(&route, acceptor),
+        )
+        .await;
         return;
     }
     let executors = CodeModeExecutors::new();
@@ -1656,6 +1783,10 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
     let reopen = script.reopen;
     let world = World {
         reopen: Cell::new(reopen),
+        dials: Cell::new(0),
+        waiting: RefCell::new(BTreeMap::new()),
+        stopped: RefCell::new(BTreeSet::new()),
+        tokens: Cell::new(0),
         slots,
         script,
         log: Arc::new(StepHost {
@@ -1779,6 +1910,9 @@ pub fn replay(seed: u64, mutation: HandsMutation, options: HandsOptions) -> Stri
     }
     if options.reopen {
         command.push_str(" --reopen");
+    }
+    if options.cancel {
+        command.push_str(" --cancel");
     }
     if mutation != HandsMutation::None {
         command.push_str(" --mutation ");

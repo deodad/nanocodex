@@ -107,6 +107,7 @@ struct Args {
     hands: HandsMutation,
     fleet: usize,
     reopen: bool,
+    cancel: bool,
     cell_calls: CellCallsMutation,
     long_thread: LongThreadMutation,
     tasks: TasksMutation,
@@ -132,7 +133,7 @@ fn usage() -> ExitCode {
        mpp: [--mutation {}]
        sync: [--mutation {}]
        streams: [--mutation {}]
-       hands: [--mutation {}] [--fleet N] [--reopen]
+       hands: [--mutation {}] [--fleet N] [--reopen] [--cancel]
        cell_calls: [--mutation {}]
        long_thread: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
@@ -203,6 +204,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut hands = HandsMutation::None;
     let mut fleet = 1_usize;
     let mut reopen = false;
+    let mut cancel = false;
     let mut cell_calls = CellCallsMutation::None;
     let mut long_thread = LongThreadMutation::None;
     let mut tasks = TasksMutation::None;
@@ -236,6 +238,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--event-bytes" => turns.event_bytes = Some(rest.next()?.parse().ok()?),
             "--owners" => turns.owners = Some(rest.next()?.parse().ok()?),
             "--reopen" => reopen = true,
+            "--cancel" => cancel = true,
             "--fleet" => {
                 fleet = rest
                     .next()?
@@ -346,6 +349,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         hands,
         fleet,
         reopen,
+        cancel,
         cell_calls,
         long_thread,
         tasks,
@@ -384,6 +388,7 @@ fn replay(seed: u64, args: &Args) -> String {
             hands::HandsOptions {
                 fleet: args.fleet,
                 reopen: args.reopen,
+                cancel: args.cancel,
             },
         );
     }
@@ -864,7 +869,11 @@ fn main() -> ExitCode {
             Scenario::Hands => hands::judge_seed(
                 seed,
                 args.hands,
-                hands::HandsOptions { fleet: args.fleet, reopen: args.reopen },
+                hands::HandsOptions {
+                    fleet: args.fleet,
+                    reopen: args.reopen,
+                    cancel: args.cancel,
+                },
                 args.twice,
                 args.options.verbose,
                 &mut hands_totals,
@@ -967,7 +976,11 @@ fn main() -> ExitCode {
             failed,
             args.twice,
             args.hands,
-            hands::HandsOptions { fleet: args.fleet, reopen: args.reopen },
+            hands::HandsOptions {
+                fleet: args.fleet,
+                reopen: args.reopen,
+                cancel: args.cancel,
+            },
             &hands_totals,
         );
     }
