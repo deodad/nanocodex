@@ -41,7 +41,8 @@ pub use message::{MessageLink, MessageWriter, SocketMessage};
 
 #[cfg(not(target_family = "wasm"))]
 pub use queue::{
-    Admit, CommandQueue, Polled, QueueOptions, QueuedCall, Settlement, request_id, serve_queue,
+    Admit, CommandQueue, Opened, Polled, QueueOptions, QueuedCall, Settlement, SharedLink,
+    request_id, serve_queue, serve_queue_sharing,
 };
 
 use crate::embedded::{CodeModeNotification, CodeModeUpdate, NestedToolCall};

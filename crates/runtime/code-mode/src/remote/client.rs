@@ -397,6 +397,7 @@ struct Client {
     local_tools_keyed: Atom<Option<(Vec<ToolDefinition>, String)>>,
     ledger: Option<Arc<dyn RemoteLedger>>,
     unacked: Atom<BTreeSet<u64>>,
+    unledgered: Atom<BTreeSet<u64>>,
     served: Atom<nanocode_sync::Map<u64, Arc<Answered>>>,
     _stop: oneshot::Sender<()>,
 }
@@ -469,6 +470,7 @@ fn resumed(
     client: Weak<Client>,
     id: u64,
     mut replies: mpsc::UnboundedReceiver<(Frame, bool)>,
+    ledgered: bool,
 ) -> ResumedReply {
     Box::pin(async move {
         let _resumed = Resumed {
@@ -485,7 +487,10 @@ fn resumed(
                         }
                         other => other,
                     };
-                    if from_hand && let Some(client) = client.upgrade() {
+                    if from_hand
+                        && ledgered
+                        && let Some(client) = client.upgrade()
+                    {
                         client.settle_reply_behind(id, &result, None);
                     }
                     return result.map_err(replied);
@@ -615,7 +620,7 @@ impl RemoteClient {
         link: impl RemoteLink,
         operation_timeout: Option<Duration>,
     ) -> (Self, HostFuture<'static, String>) {
-        let (client, driver, _) = Self::open(link, operation_timeout, Vec::new(), false, None);
+        let (client, driver, _) = Self::open(link, operation_timeout, Vec::new(), false, None, 0, false);
         (client, driver)
     }
 
@@ -624,7 +629,7 @@ impl RemoteClient {
         operation_timeout: Option<Duration>,
         pending: Vec<u64>,
     ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
-        Self::open(link, operation_timeout, pending, true, None)
+        Self::open(link, operation_timeout, pending, true, None, 0, false)
     }
 
     pub fn durable(
@@ -633,7 +638,30 @@ impl RemoteClient {
         pending: Vec<u64>,
         ledger: Arc<dyn RemoteLedger>,
     ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
-        Self::open(link, operation_timeout, pending, true, Some(ledger))
+        Self::open(link, operation_timeout, pending, true, Some(ledger), 0, false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) fn sharing(
+        link: impl RemoteLink,
+        operation_timeout: Option<Duration>,
+        queued: Vec<u64>,
+        ledger: Arc<dyn RemoteLedger>,
+        resume: Vec<u64>,
+        tool_selection: bool,
+    ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
+        let unledgered = queued.len();
+        let mut pending = queued;
+        pending.extend(resume);
+        Self::open(
+            link,
+            operation_timeout,
+            pending,
+            true,
+            Some(ledger),
+            unledgered,
+            tool_selection,
+        )
     }
 
     fn open(
@@ -642,15 +670,18 @@ impl RemoteClient {
         pending: Vec<u64>,
         settles: bool,
         ledger: Option<Arc<dyn RemoteLedger>>,
+        unledgered: usize,
+        tool_selection: bool,
     ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
         let (outgoing, frames) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
         let max_frame_bytes = link.max_frame_bytes();
         let resumes = link.resumes();
-        let tool_selection = link.supports_tool_selection();
+        let tool_selection = tool_selection || link.supports_tool_selection();
         let caches_local_tools = link.caches_local_tools();
         let mut waiters = HashMap::new();
         let mut receivers = Vec::new();
+        let queued: BTreeSet<u64> = pending.iter().take(unledgered).copied().collect();
         if resumes.is_some() {
             for id in &pending {
                 let (replies, receiver) = mpsc::unbounded_channel();
@@ -704,12 +735,17 @@ impl RemoteClient {
             local_tools_keyed: Atom::default(),
             ledger,
             unacked: Atom::default(),
+            unledgered: Atom::new(queued),
             served: Atom::default(),
             _stop: stop,
         });
         let resumed = receivers
             .into_iter()
-            .map(|(id, receiver)| (id, resumed(Arc::downgrade(&client), id, receiver)))
+            .enumerate()
+            .map(|(index, (id, receiver))| {
+                let ledgered = index >= unledgered;
+                (id, resumed(Arc::downgrade(&client), id, receiver, ledgered))
+            })
             .collect();
         let driver = Box::pin(drive(
             Arc::downgrade(&client),
@@ -729,6 +765,11 @@ impl RemoteClient {
     }
 
     pub fn ack(&self, ids: Vec<u64>) -> Result<(), CodeModeHostError> {
+        self.client.unledgered.update(|unledgered| {
+            for id in &ids {
+                unledgered.remove(id);
+            }
+        });
         self.client
             .outgoing
             .send(Outgoing::frames(
@@ -766,11 +807,20 @@ impl RemoteClient {
                 })
                 .collect();
         }
+        self.queued(calls)
+    }
+
+    pub(super) fn queued(&self, calls: Vec<(u64, RemoteOperation)>) -> Vec<CallReply> {
         let mut frames = Vec::new();
         let mut waiters = Vec::new();
         let mut replies = Vec::new();
+        if self.client.ledger.is_some() {
+            self.client.unledgered.update(|unledgered| {
+                unledgered.extend(calls.iter().map(|(id, _)| *id));
+            });
+        }
         for (id, operation) in calls {
-            match prepare_call(&self.client, id, operation, None) {
+            match prepare_call(&self.client, id, operation, None, false) {
                 Ok((frame, waiter, reply)) => {
                     frames.push(frame);
                     waiters.push(waiter);
@@ -812,6 +862,7 @@ fn prepare_call(
     id: u64,
     operation: RemoteOperation,
     barrier: Option<Arc<dyn RemoteBarrier>>,
+    ledgered: bool,
 ) -> Result<(Encoded, (u64, Waiter), CallReply), CodeModeHostError> {
     client.not_dispatched()?;
     let requested = requested_yield(&operation);
@@ -833,7 +884,7 @@ fn prepare_call(
             while let Some((frame, from_hand)) = replies.recv().await {
                 match frame {
                     Frame::Reply { result, .. } => {
-                        if from_hand {
+                        if from_hand && ledgered {
                             guard
                                 .client
                                 .settle_reply_behind(id, &result, barrier.as_deref());
@@ -959,12 +1010,18 @@ impl Client {
         }
     }
 
+    fn ledgers(&self, id: u64) -> bool {
+        self.ledger.is_some()
+            && self.resumes.is_some()
+            && !self.unledgered.read(|unledgered| unledgered.contains(&id))
+    }
+
     fn orphan(
         self: &Arc<Self>,
         id: u64,
         waiter: &Waiter,
     ) -> Option<(Waiter, HostFuture<'static, ()>)> {
-        if self.ledger.is_none() || self.resumes.is_none() {
+        if !self.ledgers(id) {
             return None;
         }
         let (replies, receiver) = mpsc::unbounded_channel();
@@ -981,8 +1038,7 @@ impl Client {
         pending: &mut Waiters,
         callbacks: &mut FuturesUnordered<HostFuture<'static, ()>>,
     ) -> Option<Frame> {
-        if self.ledger.is_none()
-            || self.resumes.is_none()
+        if !self.ledgers(id)
             || pending.contains_key(&id)
             || self.unacked.read(|unacked| unacked.contains(&id))
         {
@@ -1091,7 +1147,7 @@ impl Client {
         match frame {
             Frame::Reply { id, result } => {
                 if let Some(waiter) = pending.remove(&id) {
-                    if self.ledger.is_some() && self.resumes.is_some() {
+                    if self.ledgers(id) {
                         self.unacked.update(|unacked| unacked.insert(id));
                     }
                     let _ = waiter.replies.send((Frame::Reply { id, result }, true));
@@ -2043,7 +2099,7 @@ impl RemoteClient {
         let client = &self.client;
         let id = client.next.fetch_add(1, Ordering::Relaxed);
         let recorded = recorded(&operation);
-        let (frame, registered, reply) = prepare_call(client, id, operation, barrier.clone())?;
+        let (frame, registered, reply) = prepare_call(client, id, operation, barrier.clone(), true)?;
         client
             .record(id, recorded.as_ref(), barrier.as_deref())
             .await?;

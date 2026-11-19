@@ -15,9 +15,11 @@ use nanocode::turnlog::{Compaction, LogHost, OneLog, Policy, Rider, Write};
 use nanocode_code_mode::contract::DEFAULT_TOOL_OUTPUT_TOKENS;
 use nanocode_code_mode::embedded::{CodeModeHostError, HandCalls, HostFuture};
 use nanocode_code_mode::remote::{
-    Carried, CodeModeExecutors, NOT_RECEIVED, PEER_CLOSED, RemoteBarrier, RemoteCatalog,
-    RemoteCodeModeHost, RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation,
-    RemoteReply, RemoteTransport, output_from_wire, output_to_wire,
+    Carried, CodeModeExecutors, CommandQueue, NOT_RECEIVED, PEER_CLOSED, Polled, QueueOptions,
+    QueuedCall, RemoteBarrier, RemoteCatalog, RemoteClient, RemoteCodeModeHost, RemoteContext,
+    RemoteDelivery, RemoteFrame, RemoteLedger, RemoteLink, RemoteOperation, RemoteReply,
+    RemoteRequest, RemoteTransport, ResumedReply, Settlement, SharedLink, output_from_wire,
+    output_to_wire, request_id, serve_queue_sharing,
 };
 use nanocode_code_mode::{ToolContext, ToolOutput, ToolOutputBody};
 use nanocode_durability_core::{
@@ -68,6 +70,7 @@ const FLEET_MUTATED: usize = 3;
 const CELL_PPM: u64 = 500_000;
 const CELL: &str = "cell";
 const FLEET_COMMIT_MS_MAX: u64 = 200;
+const QUEUE_POLL: Duration = Duration::from_millis(5);
 const REOPEN_MS_MAX: u64 = START_MS_MAX + RUN_MS_MAX;
 const UNSENT: [&str; 3] = [
     "not dispatched",
@@ -75,8 +78,31 @@ const UNSENT: [&str; 3] = [
     "nothing was dispatched",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HandLink {
+    #[default]
+    Accepted,
+    Served,
+}
+
+impl HandLink {
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::Accepted, Self::Served]
+            .into_iter()
+            .find(|link| link.name() == name)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Served => "served",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HandsMutation {
+    #[default]
     None,
     AckBeforeStore,
     SkipRecord,
@@ -96,10 +122,12 @@ pub enum HandsMutation {
     ReopenOrphaned,
     ReopenUnprobed,
     CancelLate,
+    UnsharedResume,
+    StaleClient,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 21] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -119,6 +147,8 @@ impl HandsMutation {
         Self::ReopenOrphaned,
         Self::ReopenUnprobed,
         Self::CancelLate,
+        Self::UnsharedResume,
+        Self::StaleClient,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -148,6 +178,8 @@ impl HandsMutation {
             Self::ReopenOrphaned => "reopen_orphaned",
             Self::ReopenUnprobed => "reopen_unprobed",
             Self::CancelLate => "cancel_late",
+            Self::UnsharedResume => "unshared_resume",
+            Self::StaleClient => "stale_client",
         }
     }
 
@@ -160,6 +192,10 @@ impl HandsMutation {
             Self::CancelLate => HandsOptions {
                 fleet: 1,
                 cancel: true,
+                ..options
+            },
+            Self::UnsharedResume | Self::StaleClient => HandsOptions {
+                link: HandLink::Served,
                 ..options
             },
             _ => HandsOptions {
@@ -193,11 +229,39 @@ impl HandsMutation {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandsOptions {
     pub fleet: usize,
     pub reopen: bool,
     pub cancel: bool,
+    pub link: HandLink,
+    pub mutation: HandsMutation,
+}
+
+impl Default for HandsOptions {
+    fn default() -> Self {
+        Self {
+            fleet: 1,
+            reopen: false,
+            cancel: false,
+            link: HandLink::Accepted,
+            mutation: HandsMutation::None,
+        }
+    }
+}
+
+impl HandsOptions {
+    const fn effective(self) -> Self {
+        self.mutation.options(self)
+    }
+
+    pub const fn supported(self) -> bool {
+        let options = self.effective();
+        match options.link {
+            HandLink::Accepted => true,
+            HandLink::Served => options.fleet <= 1 && !options.reopen && !options.cancel,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +281,8 @@ pub struct HandsStats {
     pub orphaned: u64,
     pub stalled: u64,
     pub stopped: u64,
+    pub cells: u64,
+    pub queued: u64,
 }
 
 impl HandsStats {
@@ -236,6 +302,8 @@ impl HandsStats {
         self.orphaned += other.orphaned;
         self.stalled += other.stalled;
         self.stopped += other.stopped;
+        self.cells += other.cells;
+        self.queued += other.queued;
     }
 }
 
@@ -620,6 +688,154 @@ impl HandRequests for Store {
     }
 }
 
+struct RuntimeLedger {
+    store: Arc<Store>,
+    runtime: String,
+}
+
+impl RuntimeLedger {
+    fn pending(&self, request: RemoteRequest) -> PendingRequest {
+        PendingRequest {
+            id: request.id,
+            key: KEY.to_owned(),
+            runtime: self.runtime.clone(),
+            session_id: request.session_id,
+            call_id: request.call_id,
+            turn_id: request.turn_id,
+            reply: None,
+        }
+    }
+}
+
+impl RemoteLedger for RuntimeLedger {
+    fn sent(&self, request: RemoteRequest) -> HostFuture<'_, Result<(), String>> {
+        let request = self.pending(request);
+        Box::pin(async move { self.store.sent(&request).await })
+    }
+
+    fn sent_after<'a>(
+        &'a self,
+        request: RemoteRequest,
+        barrier: &'a dyn RemoteBarrier,
+    ) -> HostFuture<'a, Result<(), String>> {
+        let request = self.pending(request);
+        Box::pin(async move { self.store.sent_after(&request, barrier).await })
+    }
+
+    fn replied<'a>(
+        &'a self,
+        id: u64,
+        reply: &'a RemoteReply,
+    ) -> HostFuture<'a, Result<(), String>> {
+        self.store.replied(KEY, &self.runtime, id, reply)
+    }
+
+    fn rider(&self, id: u64, reply: &RemoteReply) -> Option<Carried> {
+        self.store.rider(KEY, &self.runtime, id, reply)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Queued {
+    Waiting,
+    Settled(Outcome),
+}
+
+struct SimQueue {
+    store: Arc<Store>,
+    slots: Atom<BTreeMap<usize, Queued>>,
+}
+
+impl SimQueue {
+    fn enqueue(&self, index: usize) {
+        self.slots.update(|slots| {
+            slots.entry(index).or_insert(Queued::Waiting);
+        });
+    }
+
+    fn settled(&self, index: usize) -> Option<Outcome> {
+        self.slots.read(|slots| match slots.get(&index) {
+            Some(Queued::Settled(outcome)) => Some(outcome.clone()),
+            _ => None,
+        })
+    }
+}
+
+impl CommandQueue for SimQueue {
+    type Origin = ();
+    type Error = String;
+
+    async fn poll(&self) -> Result<Polled<()>, String> {
+        self.store.write().await;
+        let calls = self.slots.read(|slots| {
+            slots
+                .iter()
+                .filter(|(_, slot)| matches!(slot, Queued::Waiting))
+                .map(|(index, _)| QueuedCall {
+                    name: "run".to_owned(),
+                    input: Arc::new(json!({})),
+                    context: RemoteContext::new(
+                        SESSION.to_owned(),
+                        index.to_string(),
+                        Some(TURN.to_owned()),
+                    ),
+                    request: None,
+                    origin: (),
+                })
+                .collect()
+        });
+        Ok(Polled {
+            calls,
+            ..Polled::default()
+        })
+    }
+
+    async fn settle(&self, settled: &[(String, Settlement)]) -> Result<(), String> {
+        self.store.write().await;
+        self.slots.update(|slots| {
+            for (command, settlement) in settled {
+                let index = command.parse().expect("queued calls are numbered");
+                let outcome = match settlement {
+                    Settlement::Completed(value) => Outcome::Value(value.clone()),
+                    Settlement::Unavailable(_) => Outcome::NotDispatched,
+                    Settlement::Unknown => Outcome::Unknown,
+                };
+                slots.insert(index, Queued::Settled(outcome));
+            }
+        });
+        Ok(())
+    }
+
+    fn turns_ended(&self, turns: &[(String, String)]) -> impl Future<Output = Vec<bool>> + Send {
+        std::future::ready(vec![false; turns.len()])
+    }
+
+    fn unsettled(&self, _: &[String], _: &str) {}
+}
+
+const fn queue_options() -> QueueOptions {
+    QueueOptions {
+        operation_timeout: None,
+        poll: QUEUE_POLL,
+        busy_poll: QUEUE_POLL,
+        end_check: GRACE,
+        cancels_calls: false,
+    }
+}
+
+struct Live {
+    client: RemoteClient,
+    runtime: String,
+    generation: u64,
+    resumed: BTreeMap<u64, ResumedReply>,
+}
+
+fn text(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("output").and_then(Value::as_str))
+}
+
 struct StepHost {
     rows: Atom<BTreeMap<u64, String>>,
     store: Arc<Store>,
@@ -874,11 +1090,19 @@ enum CallState {
     Committed(Outcome),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Session,
+    Execute,
+    Queued,
+}
+
 struct Call {
     state: CallState,
     exposed: bool,
     hand: usize,
     cell: bool,
+    kind: Kind,
 }
 
 #[derive(Default)]
@@ -951,6 +1175,11 @@ struct World {
     tokens: Cell<u64>,
     script: Script,
     store: Arc<Store>,
+    link: HandLink,
+    queue: Arc<SimQueue>,
+    live: RefCell<Option<Live>>,
+    first: RefCell<Option<(RemoteClient, String, u64)>>,
+    generation: Cell<u64>,
     log: Arc<StepHost>,
     slots: Vec<Slot>,
     calls: RefCell<Vec<Call>>,
@@ -1037,9 +1266,15 @@ impl World {
         match frame {
             RemoteFrame::Request {
                 id,
-                operation: RemoteOperation::Call { context, .. },
+                operation:
+                    operation @ (RemoteOperation::Call { .. } | RemoteOperation::Execute { .. }),
                 ..
             } => {
+                let (context, executes) = match operation {
+                    RemoteOperation::Execute { context, .. } => (context, true),
+                    RemoteOperation::Call { context, .. } => (context, false),
+                    _ => return,
+                };
                 if let Some(value) = hand.retained.get(&id) {
                     let _ = out.send(Self::reply(id, value.clone()));
                     return;
@@ -1048,14 +1283,19 @@ impl World {
                     return;
                 }
                 let index = numbered(&context.call_id);
-                let cell = self.calls.borrow()[index].cell;
+                let (cell, kind) = {
+                    let calls = self.calls.borrow();
+                    (calls[index].cell, calls[index].kind)
+                };
                 if !cell && !durable_step(&self.log, index) {
                     self.fail(
                         "folded",
                         format!("call {index} reached the hand before its step was durable"),
                     );
                 }
-                if !self.store.recorded(&context.session_id, &context.call_id) {
+                if kind != Kind::Queued
+                    && !self.store.recorded(&context.session_id, &context.call_id)
+                {
                     self.fail(
                         "folded",
                         format!("call {index} reached the hand before its request was recorded"),
@@ -1064,7 +1304,11 @@ impl World {
                 let runs = hand.executions.entry(index).or_default();
                 let label = format!("call {index} run {}", runs.len());
                 runs.push(json!(label));
-                let value = if self.fleet() {
+                let value = if executes {
+                    json!({"cell": null, "output": label, "success": true, "nested_calls": [], "notifications": []})
+                } else if kind == Kind::Queued {
+                    json!({"output": label, "success": true})
+                } else if self.fleet() {
                     output_to_wire(ToolOutput::text(label), false)
                         .expect("a simulated output encodes")
                 } else {
@@ -1092,6 +1336,14 @@ impl World {
                         self.fail(
                             "ack_after_store",
                             format!("request {id} was acked before its reply was stored"),
+                        );
+                    }
+                    if let Some(index) = self.queued_index(id)
+                        && self.queue.settled(index).is_none()
+                    {
+                        self.fail(
+                            "ack_after_store",
+                            format!("queued call {index} was acked before it settled"),
                         );
                     }
                     hand.retained.remove(&id);
@@ -1198,6 +1450,15 @@ impl World {
         }
     }
 
+    fn queued_index(&self, id: u64) -> Option<usize> {
+        self.calls
+            .borrow()
+            .iter()
+            .enumerate()
+            .find(|(index, call)| call.kind == Kind::Queued && request_id(&index.to_string()) == id)
+            .map(|(index, _)| index)
+    }
+
     fn finish(&self, at: usize, out: &mpsc::UnboundedSender<String>) {
         let now = self.now();
         let mut hand = self.slots[at].hand.borrow_mut();
@@ -1249,6 +1510,83 @@ impl World {
         }
     }
 
+    async fn serve(&self, link: SimLink, runtime: String) {
+        let resume = if self.store.mutation == HandsMutation::UnsharedResume {
+            Vec::new()
+        } else {
+            self.store
+                .pending(KEY, &runtime)
+                .await
+                .expect("the simulated ledger reads")
+        };
+        let (opened, mut clients) = mpsc::unbounded_channel();
+        let shared = SharedLink {
+            ledger: Arc::new(RuntimeLedger {
+                store: Arc::clone(&self.store),
+                runtime: runtime.clone(),
+            }),
+            resume,
+            tool_selection: false,
+            opened: Box::new(move |client, resumed| {
+                let _ = opened.send((client, resumed));
+            }),
+        };
+        let served = serve_queue_sharing(
+            link,
+            Arc::clone(&self.queue),
+            nanocode_sync::stream::iter(std::iter::empty()),
+            queue_options(),
+            std::future::pending::<String>(),
+            shared,
+        );
+        let install = async {
+            if let Some((client, resumed)) = clients.recv().await {
+                let generation = self.generation.get() + 1;
+                self.generation.set(generation);
+                *self.live.borrow_mut() = Some(Live {
+                    client,
+                    runtime: runtime.clone(),
+                    generation,
+                    resumed: resumed.into_iter().collect(),
+                });
+            }
+        };
+        let (ended, ()) = nanocode_sync::future::join(served, install).await;
+        self.live.borrow_mut().take();
+        match ended {
+            Ok(reason) => self.note(format!("served link ends: {reason}")),
+            Err(error) => self.note(format!("queue fails: {error}")),
+        }
+    }
+
+    async fn live_after(&self, after: u64) -> (RemoteClient, String, u64) {
+        if self.store.mutation == HandsMutation::StaleClient
+            && let Some(first) = self.first.borrow().clone()
+        {
+            return first;
+        }
+        loop {
+            if let Some(live) = self.live.borrow().as_ref()
+                && live.generation > after
+            {
+                let current = (live.client.clone(), live.runtime.clone(), live.generation);
+                if self.store.mutation == HandsMutation::StaleClient {
+                    self.first
+                        .borrow_mut()
+                        .get_or_insert_with(|| current.clone());
+                }
+                return current;
+            }
+            self.clock.sleep(TICK).await;
+        }
+    }
+
+    fn resumed(&self, generation: u64, id: u64) -> Option<Option<ResumedReply>> {
+        let mut live = self.live.borrow_mut();
+        let live = live.as_mut().filter(|live| live.generation == generation)?;
+        Some(live.resumed.remove(&id))
+    }
+
     async fn hand(&self, at: usize, acceptor: &Arc<Acceptor>) {
         let slot = &self.slots[at];
         loop {
@@ -1271,10 +1609,10 @@ impl World {
                 .expect("the simulated catalog decodes");
             let (to_brain, from_hand) = mpsc::unbounded_channel();
             let (to_hand, from_brain) = mpsc::unbounded_channel();
-            let link = SimLink {
+            let sim = SimLink {
                 incoming: Owned::new(from_hand),
                 outgoing: to_hand,
-                resumes: runtime,
+                resumes: runtime.clone(),
                 read: Arc::clone(&slot.read),
             };
             self.dials.set(self.dials.get() + 1);
@@ -1283,7 +1621,10 @@ impl World {
                     let mut hand = slot.hand.borrow_mut();
                     hand.held = hand.callbacks.keys().copied().collect();
                 }
-                match acceptor.attach(slot.key.clone(), catalog, link).await {
+                if self.link == HandLink::Served {
+                    return self.serve(sim, runtime).await;
+                }
+                match acceptor.attach(slot.key.clone(), catalog, sim).await {
                     Ok(attached) => attached.ended().await,
                     Err(error) => self.note(format!("attach refused: {error}")),
                 }
@@ -1493,6 +1834,145 @@ impl World {
         }
     }
 
+    async fn session(
+        &self,
+        via: &Via<'_>,
+        log: &Arc<OneLog>,
+        barrier: &Arc<dyn RemoteBarrier>,
+        index: usize,
+    ) {
+        let kind = self.calls.borrow()[index].kind;
+        match kind {
+            Kind::Session => self.session_call(via, log, index).await,
+            Kind::Execute => self.cell(log, barrier, index).await,
+            Kind::Queued => self.queued(log, barrier, index).await,
+        }
+    }
+
+    async fn started(&self, log: &Arc<OneLog>, index: usize) -> Option<bool> {
+        let state = self.calls.borrow()[index].state.clone();
+        match state {
+            CallState::Committed(_) => None,
+            CallState::Fresh => {
+                let start = self.script.starts[index];
+                let now = self.now();
+                if start > now {
+                    self.clock.sleep(Duration::from_nanos(start - now)).await;
+                }
+                if !self.admit(log, index).await {
+                    return None;
+                }
+                self.calls.borrow_mut()[index].state = CallState::Admitted;
+                Some(true)
+            }
+            CallState::Admitted => {
+                self.stats.borrow_mut().recovered += 1;
+                Some(false)
+            }
+        }
+    }
+
+    async fn answered(&self, log: &Arc<OneLog>, index: usize, outcome: Outcome) {
+        self.clock
+            .sleep(Duration::from_nanos(self.script.commits[index]))
+            .await;
+        if !self.step(log, index, ANSWERED).await {
+            return;
+        }
+        self.note(format!("call {index} commits {outcome:?}"));
+        self.calls.borrow_mut()[index].state = CallState::Committed(outcome);
+    }
+
+    async fn queued(&self, log: &Arc<OneLog>, barrier: &Arc<dyn RemoteBarrier>, index: usize) {
+        if self.started(log, index).await.is_none() {
+            return;
+        }
+        if let Err(error) = barrier.settle().await {
+            self.note(format!("call {index} step not settled: {error}"));
+            return;
+        }
+        self.queue.enqueue(index);
+        let outcome = loop {
+            if let Some(outcome) = self.queue.settled(index) {
+                break outcome;
+            }
+            self.clock.sleep(TICK).await;
+        };
+        self.answered(log, index, outcome).await;
+    }
+
+    async fn cell(&self, log: &Arc<OneLog>, barrier: &Arc<dyn RemoteBarrier>, index: usize) {
+        let Some(mut dispatch) = self.started(log, index).await else {
+            return;
+        };
+        let context =
+            RemoteContext::new(SESSION.to_owned(), index.to_string(), Some(TURN.to_owned()));
+        let mut after = 0;
+        let outcome = loop {
+            let (client, runtime, generation) = self.live_after(after).await;
+            if dispatch {
+                let operation = RemoteOperation::Execute {
+                    source: "run()".to_owned(),
+                    context: context.clone(),
+                    local_tools: Vec::new(),
+                    local_tools_key: None,
+                    hand: None,
+                    selected_tools: None,
+                };
+                let executed = client
+                    .request_after(operation, Vec::new(), None, Arc::clone(barrier))
+                    .await;
+                match executed {
+                    Ok(Some(execution)) => {
+                        let output = serde_json::to_value(&execution.output)
+                            .expect("the cell output encodes");
+                        break Outcome::Value(json!({"output": output}));
+                    }
+                    Ok(None) => break Outcome::Unknown,
+                    Err(error) => {
+                        self.note(format!("cell {index} lost its link: {error}"));
+                        dispatch = false;
+                        after = generation;
+                        continue;
+                    }
+                }
+            }
+            let row = self
+                .store
+                .find(SESSION, &context.call_id)
+                .await
+                .expect("the simulated ledger reads");
+            let Some(row) = row else {
+                dispatch = true;
+                continue;
+            };
+            if let Some(reply) = row.reply {
+                break match reply {
+                    Ok(Some(value)) => Outcome::Value(value),
+                    Ok(None) | Err(_) => Outcome::Unknown,
+                };
+            }
+            if row.runtime != runtime {
+                break Outcome::Unknown;
+            }
+            let Some(resumed) = self.resumed(generation, row.id) else {
+                after = generation;
+                continue;
+            };
+            let Some(resumed) = resumed else {
+                self.note(format!("cell {index} has no resumed reply"));
+                break Outcome::Unknown;
+            };
+            match resumed.await {
+                Ok(Some(value)) => break Outcome::Value(value),
+                Ok(None) => break Outcome::Unknown,
+                Err(error) if error.message() == NOT_RECEIVED => dispatch = true,
+                Err(_) => after = generation,
+            }
+        };
+        self.answered(log, index, outcome).await;
+    }
+
     async fn session_call(&self, via: &Via<'_>, log: &Arc<OneLog>, index: usize) {
         if self.calls.borrow()[index].cell {
             return;
@@ -1539,17 +2019,23 @@ impl World {
             }
             let hand = self.slots[call.hand].hand.borrow();
             let runs = hand.executions.get(&index).map_or(&[][..], Vec::as_slice);
-            if runs.len() > 1 {
+            let excused = call.exposed && call.kind == Kind::Queued;
+            if runs.len() > 1 && !excused {
                 self.fail("once", format!("call {index} ran {} times", runs.len()));
             }
+            let texts = runs.iter().map(text).collect::<Vec<_>>();
+            let ran = |value: &Value| match call.kind {
+                Kind::Session => runs == [value.clone()],
+                Kind::Execute | Kind::Queued => texts == [text(value)],
+            };
             match &call.state {
-                CallState::Committed(Outcome::Value(value)) if runs != [value.clone()] => {
+                CallState::Committed(Outcome::Value(value)) if !excused && !ran(value) => {
                     self.fail(
                         "real",
                         format!("call {index} committed {value} but ran {runs:?}"),
                     );
                 }
-                CallState::Committed(Outcome::NotDispatched) if !runs.is_empty() => {
+                CallState::Committed(Outcome::NotDispatched) if !excused && !runs.is_empty() => {
                     self.fail(
                         "real",
                         format!("call {index} committed not dispatched but ran"),
@@ -1636,7 +2122,7 @@ async fn runtime(world: &World, acceptor: &Arc<Acceptor>, log: &Arc<OneLog>) {
         let route = acceptor.route(Arc::new(|| Box::pin(async { Some(KEY.to_owned()) })));
         let via = Via::Route(&route, &barrier, acceptor);
         let calls =
-            (0..world.script.starts.len()).map(|index| world.session_call(&via, log, index));
+            (0..world.script.starts.len()).map(|index| world.session(&via, log, &barrier, index));
         nanocode_sync::future::join(
             nanocode_sync::join_in_order(calls),
             world.canceller(&route, acceptor),
@@ -1735,22 +2221,44 @@ pub struct HandsOutcome {
     pub shape: String,
 }
 
-fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsOutcome {
-    let options = mutation.options(options);
-    let fleet = options.fleet;
+fn simulate(seed: u64, options: HandsOptions) -> HandsOutcome {
+    let options = options.effective();
+    let HandsOptions {
+        fleet,
+        link,
+        mutation,
+        ..
+    } = options;
     let script = Script::of(seed, options);
-    let shape = script.describe();
+    let mut kinds = Rng::derive(seed, "hands kinds");
+    let kinds: Vec<Kind> = script
+        .starts
+        .iter()
+        .map(|_| match link {
+            HandLink::Accepted => Kind::Session,
+            HandLink::Served if kinds.chance(CELL_PPM) => Kind::Execute,
+            HandLink::Served => Kind::Queued,
+        })
+        .collect();
+    let cells = kinds.iter().filter(|kind| **kind == Kind::Execute).count();
+    let queued = kinds.iter().filter(|kind| **kind == Kind::Queued).count();
+    let shape = match link {
+        HandLink::Accepted => script.describe(),
+        HandLink::Served => format!("{} cells={cells} queued={queued}", script.describe()),
+    };
     let clock = Clock::new();
     crate::host::enter(seed, &clock);
     let calls = script
         .hands
         .iter()
         .zip(&script.cells)
-        .map(|(hand, cell)| Call {
+        .zip(kinds)
+        .map(|((hand, cell), kind)| Call {
             state: CallState::Fresh,
             exposed: false,
             hand: *hand,
             cell: *cell,
+            kind,
         })
         .collect();
     let slots = script
@@ -1782,6 +2290,14 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
     });
     let reopen = script.reopen;
     let world = World {
+        link,
+        queue: Arc::new(SimQueue {
+            store: Arc::clone(&store),
+            slots: Atom::default(),
+        }),
+        live: RefCell::new(None),
+        first: RefCell::new(None),
+        generation: Cell::new(0),
         reopen: Cell::new(reopen),
         dials: Cell::new(0),
         waiting: RefCell::new(BTreeMap::new()),
@@ -1804,6 +2320,8 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
         stats: RefCell::new(HandsStats {
             seeds: 1,
             calls: u64::try_from(Script::of(seed, options).starts.len()).unwrap_or(u64::MAX),
+            cells: u64::try_from(cells).unwrap_or(u64::MAX),
+            queued: u64::try_from(queued).unwrap_or(u64::MAX),
             ..HandsStats::default()
         }),
     };
@@ -1820,6 +2338,8 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
             Rng::derive(seed ^ epoch, "hands scheduler"),
         );
         let ended = executor.run(tasks, Some(horizon));
+        world.live.borrow_mut().take();
+        world.first.borrow_mut().take();
         drop(executor);
         drop(crate::host::spawned());
         match ended {
@@ -1860,8 +2380,8 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
     }
 }
 
-pub fn run_seed(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsOutcome {
-    std::panic::catch_unwind(|| simulate(seed, mutation, options)).unwrap_or_else(|panic| {
+pub fn run_seed(seed: u64, options: HandsOptions) -> HandsOutcome {
+    std::panic::catch_unwind(|| simulate(seed, options)).unwrap_or_else(|panic| {
         let message = panic
             .downcast_ref::<String>()
             .cloned()
@@ -1878,13 +2398,12 @@ pub fn run_seed(seed: u64, mutation: HandsMutation, options: HandsOptions) -> Ha
 
 pub fn judge_seed(
     seed: u64,
-    mutation: HandsMutation,
     options: HandsOptions,
     twice: bool,
     verbose: bool,
     totals: &mut HandsStats,
 ) -> Option<String> {
-    let first = run_seed(seed, mutation, options);
+    let first = run_seed(seed, options);
     totals.add(&first.stats);
     if verbose {
         println!("seed {seed} digest {:016x} {}", first.digest, first.shape);
@@ -1894,7 +2413,7 @@ pub fn judge_seed(
             .wrong
             .map(|message| format!("{} :: {message}", first.shape));
     }
-    let second = crate::host::second_pass(|| run_seed(seed, mutation, options));
+    let second = crate::host::second_pass(|| run_seed(seed, options));
     (second.digest != first.digest || second.wrong.is_some()).then(|| {
         format!(
             "{} :: nondeterminism: trace digest {:016x} then {:016x}",
@@ -1903,8 +2422,11 @@ pub fn judge_seed(
     })
 }
 
-pub fn replay(seed: u64, mutation: HandsMutation, options: HandsOptions) -> String {
+pub fn replay(seed: u64, options: HandsOptions) -> String {
     let mut command = format!("nanocode-sim --scenario hands --seed {seed}");
+    if options.link == HandLink::Served {
+        command.push_str(" --hand-link served");
+    }
     if options.fleet > 1 {
         command.push_str(&format!(" --fleet {}", options.fleet));
     }
@@ -1914,9 +2436,9 @@ pub fn replay(seed: u64, mutation: HandsMutation, options: HandsOptions) -> Stri
     if options.cancel {
         command.push_str(" --cancel");
     }
-    if mutation != HandsMutation::None {
+    if options.mutation != HandsMutation::None {
         command.push_str(" --mutation ");
-        command.push_str(mutation.name());
+        command.push_str(options.mutation.name());
     }
     command
 }
@@ -1926,16 +2448,21 @@ pub fn report(
     passed: u64,
     failed: u64,
     twice: bool,
-    mutation: HandsMutation,
     options: HandsOptions,
     totals: &HandsStats,
 ) -> ExitCode {
+    let HandsOptions {
+        fleet,
+        link,
+        mutation,
+        ..
+    } = options.effective();
     println!(
-        "RESULT seeds={}..{} scenario=hands mutation={} fleet={} passed={passed} failed={failed} twice={twice} stats={totals:?}",
+        "RESULT seeds={}..{} scenario=hands link={} mutation={} fleet={fleet} passed={passed} failed={failed} twice={twice} stats={totals:?}",
         seeds.start,
         seeds.end,
+        link.name(),
         mutation.name(),
-        mutation.options(options).fleet
     );
     match mutation {
         HandsMutation::None if failed == 0 => ExitCode::SUCCESS,

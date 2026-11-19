@@ -16,8 +16,8 @@ use nanocode_sync::{
 use serde_json::Value;
 
 use super::{
-    NOT_RECEIVED, RemoteClient, RemoteContext, RemoteLink, RemoteOperation, RemoteTransport,
-    output_from_wire,
+    NOT_RECEIVED, RemoteClient, RemoteContext, RemoteLedger, RemoteLink, RemoteOperation,
+    RemoteTransport, ResumedReply, output_from_wire,
 };
 use crate::embedded::CodeModeHostError;
 
@@ -151,6 +151,15 @@ enum Done {
     },
 }
 
+pub type Opened = Box<dyn FnOnce(RemoteClient, Vec<(u64, ResumedReply)>) + Send>;
+
+pub struct SharedLink {
+    pub ledger: Arc<dyn RemoteLedger>,
+    pub resume: Vec<u64>,
+    pub tool_selection: bool,
+    pub opened: Opened,
+}
+
 pub async fn serve_queue<Q: CommandQueue>(
     link: impl RemoteLink,
     queue: Arc<Q>,
@@ -158,12 +167,53 @@ pub async fn serve_queue<Q: CommandQueue>(
     options: QueueOptions,
     failed: impl Future<Output = Q::Error>,
 ) -> Result<String, Q::Error> {
+    served(link, queue, wakeups, options, failed, None).await
+}
+
+pub async fn serve_queue_sharing<Q: CommandQueue>(
+    link: impl RemoteLink,
+    queue: Arc<Q>,
+    wakeups: impl Stream<Item = ()> + Send,
+    options: QueueOptions,
+    failed: impl Future<Output = Q::Error>,
+    shared: SharedLink,
+) -> Result<String, Q::Error> {
+    served(link, queue, wakeups, options, failed, Some(shared)).await
+}
+
+async fn served<Q: CommandQueue>(
+    link: impl RemoteLink,
+    queue: Arc<Q>,
+    wakeups: impl Stream<Item = ()> + Send,
+    options: QueueOptions,
+    failed: impl Future<Output = Q::Error>,
+    shared: Option<SharedLink>,
+) -> Result<String, Q::Error> {
     let first = queue.poll().await?;
     let mut flights: HashMap<String, String> = HashMap::new();
     let mut stopped: HashMap<String, String> = HashMap::new();
-    let pending = first.calls.iter().map(QueuedCall::request_id).collect();
-    let (client, driver, resumed) =
-        RemoteClient::resuming(link, options.operation_timeout, pending);
+    let pending: Vec<u64> = first.calls.iter().map(QueuedCall::request_id).collect();
+    let (client, driver, resumed) = match shared {
+        None => RemoteClient::resuming(link, options.operation_timeout, pending),
+        Some(SharedLink {
+            ledger,
+            resume,
+            tool_selection,
+            opened,
+        }) => {
+            let queued = pending.len();
+            let (client, driver, mut resumed) = RemoteClient::sharing(
+                link,
+                options.operation_timeout,
+                pending,
+                ledger,
+                resume,
+                tool_selection,
+            );
+            opened(client.clone(), resumed.split_off(queued));
+            (client, driver, resumed)
+        }
+    };
     let mut driver = nanocode_platform::spawn_task(driver);
     let mut replies: FuturesUnordered<Replied> = FuturesUnordered::new();
     for (call, (request, reply)) in first.calls.iter().zip(resumed) {
@@ -265,7 +315,7 @@ pub async fn serve_queue<Q: CommandQueue>(
                         }
                     }
                 }
-                for ((command, request), reply) in sent.into_iter().zip(client.calls(operations)) {
+                for ((command, request), reply) in sent.into_iter().zip(client.queued(operations)) {
                     replies.push(Box::pin(
                         reply.map(move |result| (command, request, false, result.map(Some))),
                     ));

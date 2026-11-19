@@ -107,10 +107,7 @@ struct Args {
     mpp: MppMutation,
     sync: SyncMutation,
     streams: StreamsMutation,
-    hands: HandsMutation,
-    fleet: usize,
-    reopen: bool,
-    cancel: bool,
+    hands: hands::HandsOptions,
     cell_calls: CellCallsMutation,
     long_thread: LongThreadMutation,
     tasks: TasksMutation,
@@ -136,7 +133,7 @@ fn usage() -> ExitCode {
        mpp: [--mutation {}]
        sync: [--mutation {}]
        streams: [--mutation {}]
-       hands: [--mutation {}] [--fleet N] [--reopen] [--cancel]
+       hands: [--hand-link accepted|served] [--mutation {}] [--fleet N] [--reopen] [--cancel]
        cell_calls: [--mutation {}]
        long_thread: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
@@ -204,10 +201,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut mpp = MppMutation::None;
     let mut sync = SyncMutation::None;
     let mut streams = StreamsMutation::None;
-    let mut hands = HandsMutation::None;
-    let mut fleet = 1_usize;
-    let mut reopen = false;
-    let mut cancel = false;
+    let mut hands = hands::HandsOptions::default();
     let mut cell_calls = CellCallsMutation::None;
     let mut long_thread = LongThreadMutation::None;
     let mut tasks = TasksMutation::None;
@@ -228,6 +222,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--store" => whole.store = Some(StoreKind::parse(rest.next()?)?),
             "--deferred-start" => whole.deferred_start = true,
             "--wire" => whole.wire = WireKind::parse(rest.next()?)?,
+            "--hand-link" => hands.link = hands::HandLink::parse(rest.next()?)?,
             "--children" => whole.children = ChildMode::parse(rest.next()?)?,
             "--policy" => turns.policy = PolicyKind::parse(rest.next()?)?,
             "--row-limit" => turns.row_limit = Some(rest.next()?.parse().ok()?),
@@ -240,10 +235,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--state-bytes" => turns.state_bytes = Some(rest.next()?.parse().ok()?),
             "--event-bytes" => turns.event_bytes = Some(rest.next()?.parse().ok()?),
             "--owners" => turns.owners = Some(rest.next()?.parse().ok()?),
-            "--reopen" => reopen = true,
-            "--cancel" => cancel = true,
+            "--reopen" => hands.reopen = true,
+            "--cancel" => hands.cancel = true,
             "--fleet" => {
-                fleet = rest
+                hands.fleet = rest
                     .next()?
                     .parse()
                     .ok()
@@ -308,7 +303,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::Mpp, Some(name)) => mpp = MppMutation::parse(name)?,
         (Scenario::Sync, Some(name)) => sync = SyncMutation::parse(name)?,
         (Scenario::Streams, Some(name)) => streams = StreamsMutation::parse(name)?,
-        (Scenario::Hands, Some(name)) => hands = HandsMutation::parse(name)?,
+        (Scenario::Hands, Some(name)) => hands.mutation = HandsMutation::parse(name)?,
         (Scenario::CellCalls, Some(name)) => cell_calls = CellCallsMutation::parse(name)?,
         (Scenario::LongThread, Some(name)) => long_thread = LongThreadMutation::parse(name)?,
         (Scenario::Executor, Some(name)) => tasks = TasksMutation::parse(name)?,
@@ -335,6 +330,9 @@ fn parse_args(args: &[String]) -> Option<Args> {
     if whole.store_mutation != Mutation::None && whole.store != Some(StoreKind::Kv) {
         return None;
     }
+    if !hands.supported() {
+        return None;
+    }
     turns.verbose = options.verbose;
     whole.verbose = options.verbose;
     whole.calm = turns.calm;
@@ -352,9 +350,6 @@ fn parse_args(args: &[String]) -> Option<Args> {
         sync,
         streams,
         hands,
-        fleet,
-        reopen,
-        cancel,
         cell_calls,
         long_thread,
         tasks,
@@ -387,15 +382,7 @@ fn replay(seed: u64, args: &Args) -> String {
         return streams::replay(seed, args.streams);
     }
     if args.scenario == Scenario::Hands {
-        return hands::replay(
-            seed,
-            args.hands,
-            hands::HandsOptions {
-                fleet: args.fleet,
-                reopen: args.reopen,
-                cancel: args.cancel,
-            },
-        );
+        return hands::replay(seed, args.hands);
     }
     if args.scenario == Scenario::CellCalls {
         return cellcalls::replay(seed, args.cell_calls);
@@ -791,7 +778,7 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::Mpp && args.mpp != MppMutation::None)
         || (args.scenario == Scenario::Sync && args.sync != SyncMutation::None)
         || (args.scenario == Scenario::Streams && args.streams != StreamsMutation::None)
-        || (args.scenario == Scenario::Hands && args.hands != HandsMutation::None)
+        || (args.scenario == Scenario::Hands && args.hands.mutation != HandsMutation::None)
         || (args.scenario == Scenario::CellCalls && args.cell_calls != CellCallsMutation::None)
         || (args.scenario == Scenario::LongThread && args.long_thread != LongThreadMutation::None)
         || (args.scenario == Scenario::Executor && args.tasks != TasksMutation::None)
@@ -884,11 +871,6 @@ fn main() -> ExitCode {
             Scenario::Hands => hands::judge_seed(
                 seed,
                 args.hands,
-                hands::HandsOptions {
-                    fleet: args.fleet,
-                    reopen: args.reopen,
-                    cancel: args.cancel,
-                },
                 args.twice,
                 args.options.verbose,
                 &mut hands_totals,
@@ -991,11 +973,6 @@ fn main() -> ExitCode {
             failed,
             args.twice,
             args.hands,
-            hands::HandsOptions {
-                fleet: args.fleet,
-                reopen: args.reopen,
-                cancel: args.cancel,
-            },
             &hands_totals,
         );
     }
