@@ -1,5 +1,6 @@
 mod agents;
 mod requestclose;
+mod inboxstress;
 #[cfg(unix)]
 mod alloc;
 #[cfg(unix)]
@@ -59,6 +60,7 @@ use crate::{
     cellcalls::{CellCallsMutation, CellCallsStats},
     longthread::{LongThreadMutation, LongThreadStats},
     requestclose::RequestCloseStats,
+    inboxstress::InboxStressStats,
     sync::{SyncMutation, SyncStats},
     tasks::{TasksMutation, TasksStats},
     websocket::{WebSocketMutation, WebSocketStats},
@@ -86,6 +88,7 @@ enum Scenario {
     CellCalls,
     LongThread,
     RequestClose,
+    InboxStress,
     Capture,
     Executor,
     Dns,
@@ -125,7 +128,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|capture|executor|dns] [--ops N] [--twice] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|inbox_stress|capture|executor|dns] [--ops N] [--twice] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -265,6 +268,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "cell_calls" => Scenario::CellCalls,
                     "long_thread" => Scenario::LongThread,
                     "request_close" => Scenario::RequestClose,
+                    "inbox_stress" => Scenario::InboxStress,
                     "executor" => Scenario::Executor,
                     #[cfg(unix)]
                     "capture" => Scenario::Capture,
@@ -309,6 +313,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::LongThread, Some(name)) => long_thread = LongThreadMutation::parse(name)?,
         (Scenario::Executor, Some(name)) => tasks = TasksMutation::parse(name)?,
         (Scenario::RequestClose, Some(_)) => return None,
+        (Scenario::InboxStress, Some(_)) => return None,
         #[cfg(unix)]
         (Scenario::Capture, Some(name)) => capture = capture::CaptureMutation::parse(name)?,
         #[cfg(not(unix))]
@@ -400,6 +405,9 @@ fn replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::RequestClose {
         return requestclose::replay(seed);
+    }
+    if args.scenario == Scenario::InboxStress {
+        return inboxstress::replay(seed);
     }
     if args.scenario == Scenario::Agents {
         let mut command = format!("nanocode-sim --scenario agents --seed {seed}");
@@ -802,6 +810,7 @@ fn main() -> ExitCode {
     let mut cell_calls_totals = CellCallsStats::default();
     let mut long_thread_totals = LongThreadStats::default();
     let mut request_close_totals = RequestCloseStats::default();
+    let mut inbox_stress_totals = InboxStressStats::default();
     let mut tasks_totals = TasksStats::default();
     #[cfg(unix)]
     let mut capture_totals = capture::CaptureStats::default();
@@ -865,6 +874,12 @@ fn main() -> ExitCode {
                 args.twice,
                 args.options.verbose,
                 &mut request_close_totals,
+            ),
+            Scenario::InboxStress => inboxstress::judge(
+                seed,
+                args.twice,
+                args.options.verbose,
+                &mut inbox_stress_totals,
             ),
             Scenario::Hands => hands::judge_seed(
                 seed,
@@ -992,6 +1007,9 @@ fn main() -> ExitCode {
     }
     if args.scenario == Scenario::RequestClose {
         return requestclose::report(&args.seeds, passed, failed, args.twice, &request_close_totals);
+    }
+    if args.scenario == Scenario::InboxStress {
+        return inboxstress::report(&args.seeds, passed, failed, args.twice, &inbox_stress_totals);
     }
     if args.scenario == Scenario::Executor {
         return tasks::report(&args.seeds, passed, failed, args.twice, args.tasks, &tasks_totals);

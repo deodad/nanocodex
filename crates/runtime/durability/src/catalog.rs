@@ -1075,6 +1075,34 @@ mod store {
             Ok(completed.into_iter().map(|(_, operation_id)| operation_id).collect())
         }
 
+        pub async fn steer_read(&self, id: &str, message_id: &str) -> Result<Option<bool>> {
+            let Some(state) = self.peek(id).await? else {
+                return Ok(None);
+            };
+            let mut pending = false;
+            for operation in state.operations().values() {
+                let Some(receipt) = operation.steer_receipts.get(message_id) else {
+                    continue;
+                };
+                if receipt.withdrawn {
+                    continue;
+                }
+                let bound = receipt.index <= operation.retired_steers
+                    || receipt
+                        .index
+                        .checked_sub(operation.retired_steers + 1)
+                        .and_then(|position| operation.steers.get(position as usize))
+                        .is_some_and(|steer| steer.model_call_index.is_some());
+                match &operation.status {
+                    OperationStatus::Completed { .. } => return Ok(Some(true)),
+                    _ if bound => return Ok(Some(true)),
+                    status if !status.is_terminal() => pending = true,
+                    _ => {}
+                }
+            }
+            Ok((!pending).then_some(false))
+        }
+
         /// Operation `request_id`'s stored continuation (the head's first
         /// pending operation's when `None`), read and hydrated from the store
         /// as its family's execution reads it, without an owner or a claim:

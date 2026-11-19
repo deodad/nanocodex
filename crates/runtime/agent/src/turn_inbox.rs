@@ -1321,7 +1321,9 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             }
             SteerReceiptStatus::Unknown => return Ok(MovedQueued::Unknown),
         }
-        self.withdraw_steered(&queued).await?;
+        if self.runtime.steer_read(self.session_id(), queued_id).await? == Some(true) {
+            self.withdraw_steered(&queued).await?;
+        }
         Ok(MovedQueued::Moved)
     }
 
@@ -1348,9 +1350,16 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             && let Some(prompt) = queued.prompt.clone()
             && self.agent.steer_receipt(id.to_owned(), prompt).await?
                 == SteerReceiptStatus::Accepted
-            && let Some(record) = self.withdraw_steered(&queued).await?
         {
-            return Ok(Driven::Finished(record));
+            match self.runtime.steer_read(self.session_id(), id).await? {
+                Some(true) => {
+                    if let Some(record) = self.withdraw_steered(&queued).await? {
+                        return Ok(Driven::Finished(record));
+                    }
+                }
+                Some(false) => {}
+                None => return Ok(Driven::Waiting(id.to_owned())),
+            }
         }
         let Some(Started {
             previous,

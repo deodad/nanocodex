@@ -157,6 +157,17 @@ impl AgentRuntime {
             .map_err(catalog_error)
     }
 
+    pub(crate) async fn steer_read(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<bool>, NanocodeError> {
+        self.durable_store()?
+            .steer_read(session_id, message_id)
+            .await
+            .map_err(catalog_error)
+    }
+
     pub async fn settle(&self, session_id: &str) -> Result<bool, NanocodeError> {
         let Some(control) = self.delegates() else {
             return Ok(self.pending_turns(session_id).await?.is_empty());
