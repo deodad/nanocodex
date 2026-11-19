@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use nanocode_subagents::{AgentId, AgentUpdate, ScopedAgentUpdate};
+use nanocode_subagents::{AgentId, AgentUpdate, COMPLETION_REQUEST_PREFIX, ScopedAgentUpdate};
 use nanocode_sync::future::{Either, select};
 use nanocode_sync::{Atom, Owned};
 use nanocode_tool_host::embedded::HostFuture;
@@ -265,9 +265,17 @@ struct Requests {
     requests: HashMap<String, Request>,
     turns: HashMap<String, String>,
     usage: HashMap<String, nanocode_agent_core::TurnUsage>,
+    holder: Option<String>,
 }
 
 impl Requests {
+    fn owner(&self, id: &str) -> String {
+        match &self.holder {
+            Some(holder) if id.starts_with(COMPLETION_REQUEST_PREFIX) => holder.clone(),
+            _ => id.to_owned(),
+        }
+    }
+
     fn cancelled(&self, id: &str) -> bool {
         self.requests
             .get(id)
@@ -651,7 +659,7 @@ impl<L: ?Sized> Shared<L> {
                     self.state.read(|state| {
                         state
                             .requests
-                            .get(id)
+                            .get(&state.owner(id))
                             .is_some_and(|request| request.running == Some(Run::Inbox))
                     })
                 })
@@ -670,7 +678,10 @@ impl<L: ?Sized> Shared<L> {
             SessionEvent::Subagent(_) => return None,
         };
         let ids: Identifiers = serde_json::from_str(event.payload.get()).unwrap_or_default();
-        match (ids.turn_id, ids.request_id) {
+        let accepted = ids
+            .request_id
+            .map(|id| self.state.read(|state| state.owner(&id)));
+        match (ids.turn_id, accepted) {
             (Some(turn), _) if !agent => Some(turn),
             (Some(turn), Some(accepted))
                 if self.state.read(|state| {
@@ -685,11 +696,13 @@ impl<L: ?Sized> Shared<L> {
                 });
                 Some(accepted)
             }
-            (Some(turn), _) => Some(
-                self.state
-                    .read(|state| state.turns.get(&turn).cloned())
-                    .unwrap_or(turn),
-            ),
+            (Some(turn), _) => Some(self.state.read(|state| {
+                state
+                    .turns
+                    .get(&turn)
+                    .cloned()
+                    .unwrap_or_else(|| state.owner(&turn))
+            })),
             (None, accepted) => accepted,
         }
     }
@@ -882,6 +895,23 @@ fn ignore_inactive(result: Result<(), NanocodeError>) -> Result<(), NanocodeErro
     match result {
         Err(NanocodeError::TurnNotCancellable) => Ok(()),
         other => other,
+    }
+}
+
+struct Hold<'a, L: ?Sized>(&'a Shared<L>);
+
+impl<'a, L: ?Sized> Hold<'a, L> {
+    fn new(shared: &'a Shared<L>, id: &str) -> Self {
+        shared
+            .state
+            .update(|state| state.holder = Some(id.to_owned()));
+        Self(shared)
+    }
+}
+
+impl<L: ?Sized> Drop for Hold<'_, L> {
+    fn drop(&mut self) {
+        self.0.state.update(|state| state.holder = None);
     }
 }
 
@@ -1184,6 +1214,17 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             delegates.await_restored(&self.agent, root).await;
         }
         if let Some(first) = self.runtime.pending_turns(root).await?.into_iter().next() {
+            if first.starts_with(COMPLETION_REQUEST_PREFIX)
+                && let Some(open) = self
+                    .shared
+                    .log
+                    .pending()
+                    .await?
+                    .into_iter()
+                    .find(|record| record.state == TurnState::Running)
+            {
+                return self.run(&open.request_id, true).await;
+            }
             return match self.shared.log.turn(&first).await? {
                 Some(record) if !record.state.is_terminal() => self.run(&first, true).await,
                 record => {
@@ -1329,6 +1370,7 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             None
         };
         let cancel = record.cancel_requested;
+        let _hold = Hold::new(&self.shared, id);
         let Some(prompt) = stored.or(record.prompt) else {
             return if cancel {
                 self.finish(
@@ -1346,7 +1388,11 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
                 .await
             };
         };
-        match self.execute(id, prompt, cancel, Run::Inbox).await {
+        let outcome = match self.execute(id, prompt, cancel, Run::Inbox).await {
+            DurableOutcome::Completed(message) => self.children(id, message).await,
+            outcome => outcome,
+        };
+        match outcome {
             DurableOutcome::Completed(message) => {
                 let mut ok = serde_json::json!({"ok": {
                     "session_id": self.session_id(),
@@ -1379,6 +1425,54 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             DurableOutcome::Waiting => Ok(Driven::Waiting(id.to_owned())),
             DurableOutcome::Interrupted => Ok(Driven::Interrupted(id.to_owned())),
         }
+    }
+
+    async fn children(&self, id: &str, message: String) -> DurableOutcome {
+        let Some(delegates) = self.runtime.delegates() else {
+            return DurableOutcome::Completed(message);
+        };
+        let root = self.session_id();
+        loop {
+            if self.shared.state.read(|state| state.cancelled(id)) {
+                return DurableOutcome::Cancelled;
+            }
+            if !self.completion_turns().is_empty() {
+                self.agent.requests_settled().await;
+                continue;
+            }
+            let activity = delegates.activity(root).await;
+            if activity.is_quiescent() && self.completion_turns().is_empty() {
+                break;
+            }
+            delegates.activity_after(root, activity.revision).await;
+        }
+        let Ok(completed) = self.runtime.completed_after(root, id).await else {
+            return DurableOutcome::Interrupted;
+        };
+        let Some(last) = completed
+            .into_iter()
+            .rfind(|pass| pass.starts_with(COMPLETION_REQUEST_PREFIX))
+        else {
+            return DurableOutcome::Completed(message);
+        };
+        match self
+            .runtime
+            .durable_outcome(root, &last, Err(NanocodeError::TurnStopped))
+            .await
+        {
+            DurableOutcome::Completed(text) => DurableOutcome::Completed(text),
+            DurableOutcome::Waiting | DurableOutcome::Interrupted => DurableOutcome::Interrupted,
+            _ => DurableOutcome::Completed(message),
+        }
+    }
+
+    fn completion_turns(&self) -> Vec<String> {
+        self.agent
+            .turn_controls()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| id.starts_with(COMPLETION_REQUEST_PREFIX))
+            .collect()
     }
 
     async fn resume(

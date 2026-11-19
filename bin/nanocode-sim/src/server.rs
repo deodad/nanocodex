@@ -255,7 +255,7 @@ fn code(action: &Action, label: &str) -> String {
     }
 }
 
-fn events(model: &str, id: &str, block: &Value, delta: Option<Value>, stop: &str) -> String {
+pub(crate) fn events(model: &str, id: &str, block: &Value, delta: Option<Value>, stop: &str) -> String {
     let mut list = vec![
         (
             "message_start",

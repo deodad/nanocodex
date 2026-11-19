@@ -1050,6 +1050,31 @@ mod store {
             loading::turn(self, id, request_id).await
         }
 
+        pub async fn completed_after(&self, id: &str, request_id: &str) -> Result<Vec<String>> {
+            let Some(state) = self.peek(id).await? else {
+                return Ok(Vec::new());
+            };
+            let Some(since) = state
+                .operations()
+                .iter()
+                .find(|(operation_id, _)| operation_id.as_str() == request_id)
+                .map(|(_, operation)| operation.accepted_order())
+            else {
+                return Ok(Vec::new());
+            };
+            let mut completed: Vec<(u64, String)> = state
+                .operations()
+                .iter()
+                .filter(|(_, operation)| {
+                    operation.accepted_order() > since
+                        && matches!(operation.status, OperationStatus::Completed { .. })
+                })
+                .map(|(operation_id, operation)| (operation.accepted_order(), operation_id.clone()))
+                .collect();
+            completed.sort_unstable();
+            Ok(completed.into_iter().map(|(_, operation_id)| operation_id).collect())
+        }
+
         /// Operation `request_id`'s stored continuation (the head's first
         /// pending operation's when `None`), read and hydrated from the store
         /// as its family's execution reads it, without an owner or a claim:

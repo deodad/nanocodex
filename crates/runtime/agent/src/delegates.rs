@@ -12,6 +12,8 @@ use crate::{
 
 pub(crate) trait Delegates: Send + Sync + 'static {
     fn activity<'a>(&'a self, root: &'a str) -> HostFuture<'a, SubagentActivity>;
+    fn activity_after<'a>(&'a self, root: &'a str, revision: u64)
+    -> HostFuture<'a, SubagentActivity>;
     fn await_restored<'a>(&'a self, parent: &'a Agent, root: &'a str) -> HostFuture<'a, ()>;
     fn control(&self) -> &SubagentControl;
     fn deliver_completions<'a>(&'a self, parent: &'a Agent, root: &'a str) -> HostFuture<'a, ()>;
@@ -57,6 +59,14 @@ struct Live {
 impl Delegates for Live {
     fn activity<'a>(&'a self, root: &'a str) -> HostFuture<'a, SubagentActivity> {
         Box::pin(self.control.activity(root))
+    }
+
+    fn activity_after<'a>(
+        &'a self,
+        root: &'a str,
+        revision: u64,
+    ) -> HostFuture<'a, SubagentActivity> {
+        Box::pin(self.control.activity_after(root, revision))
     }
 
     fn await_restored<'a>(&'a self, parent: &'a Agent, root: &'a str) -> HostFuture<'a, ()> {

@@ -206,6 +206,12 @@ impl SubagentControl {
         self.registry.activity(root_session_id).await
     }
 
+    pub async fn activity_after(&self, root_session_id: &str, revision: u64) -> SubagentActivity {
+        let mut changes = self.registry.revision.subscribe();
+        drop(changes.wait_for(|current| *current != revision).await);
+        self.registry.activity(root_session_id).await
+    }
+
     pub async fn deliver_completions(
         &self,
         parent: &Agent,
