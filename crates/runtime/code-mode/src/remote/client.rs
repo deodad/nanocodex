@@ -191,6 +191,14 @@ type Sending<'a> = (
 type Encoded = (Frame, Option<String>);
 
 #[derive(Clone)]
+struct Answered {
+    session_id: String,
+    result: Result<Value, String>,
+    text: Option<String>,
+    delivery: RemoteDelivery,
+}
+
+#[derive(Clone)]
 struct Waiter {
     replies: mpsc::UnboundedSender<(Frame, bool)>,
     written: Arc<AtomicBool>,
@@ -388,6 +396,7 @@ struct Client {
     local_tools_keyed: Atom<Option<(Vec<ToolDefinition>, String)>>,
     ledger: Option<Arc<dyn RemoteLedger>>,
     unacked: Atom<BTreeSet<u64>>,
+    served: Atom<nanocode_sync::Map<u64, Arc<Answered>>>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -663,6 +672,7 @@ impl RemoteClient {
             local_tools_keyed: Atom::default(),
             ledger,
             unacked: Atom::default(),
+            served: Atom::default(),
             _stop: stop,
         });
         let resumed = receivers
@@ -950,6 +960,8 @@ impl Client {
             });
             self.receipts
                 .update(|receipts| receipts.retain(|(session, _), _| session != session_id));
+            self.served
+                .update(|served| served.retain(|_, answered| answered.session_id != *session_id));
             self.answers.forget(&answer_key(session_id, ""));
             self.turns.update(|turns| {
                 turns.remove(session_id);
@@ -1015,6 +1027,7 @@ impl Client {
                     self.unacked
                         .read(|unacked| unacked.iter().copied().collect::<Vec<_>>()),
                 );
+                pending.sort_unstable();
                 self.outgoing
                     .send(Outgoing::frames(
                         vec![Frame::Resume { pending }],
@@ -1063,6 +1076,9 @@ impl Client {
                 answers,
                 asked,
             } => {
+                if self.served_again(id) {
+                    return Ok(None);
+                }
                 if asked {
                     let mut kept = input.clone();
                     if let (Some(hand), Value::Object(fields)) = (&hand, &mut kept) {
@@ -1123,6 +1139,8 @@ impl Client {
         });
         let adopter = Arc::downgrade(self);
         let hands = Option::clone(&self.hands.get());
+        let durable = self.ledger.is_some();
+        let session_id = context.session_id.clone();
         let delivery = if hand.is_some() {
             RemoteDelivery::Immediate
         } else {
@@ -1157,12 +1175,24 @@ impl Client {
                                 "brain callback origin for `{name}` on hand `{hand}` unavailable"
                             ))
                         })?;
-                        let hands = hands.ok_or_else(|| {
-                            error("this brain does not route calls between hands")
-                        })?;
+                        let hands = hands
+                            .or_else(|| {
+                                adopter
+                                    .upgrade()
+                                    .and_then(|client| Option::clone(&client.hands.get()))
+                            })
+                            .ok_or_else(|| {
+                                error("this brain does not route calls between hands")
+                            })?;
                         authoritative.call_id = context.call_id;
                         let owned = authoritative.owned();
-                        let mut output = hands.call(&hand, &name, input, owned.as_context()).await;
+                        let mut output = if durable {
+                            hands
+                                .call_once(&hand, &name, input, owned.as_context())
+                                .await
+                        } else {
+                            hands.call(&hand, &name, input, owned.as_context()).await
+                        };
                         hold(&mut output);
                         return encode_output(output, compact, output_prefix);
                     }
@@ -1217,6 +1247,19 @@ impl Client {
                         }
                     },
                 };
+                if let (Some(client), Frame::CallbackResult { result, .. }) =
+                    (client.upgrade(), &frame)
+                {
+                    let answered = Arc::new(Answered {
+                        session_id: session_id.clone(),
+                        result: result.clone(),
+                        text: text.clone(),
+                        delivery,
+                    });
+                    client
+                        .served
+                        .update(|served| served.insert(id, Arc::clone(&answered)));
+                }
                 let _ = outgoing.send(Outgoing::Send {
                     frames: vec![(frame, text)],
                     delivery,
@@ -1232,6 +1275,29 @@ impl Client {
         })
     }
 
+    fn served_again(&self, id: u64) -> bool {
+        if self.running.read(|running| running.contains_key(&id)) {
+            return true;
+        }
+        let again = self.served.read(|served| served.get(&id).cloned());
+        let Some(answered) = again else {
+            return false;
+        };
+        let _ = self.outgoing.send(Outgoing::Send {
+            frames: vec![(
+                Frame::CallbackResult {
+                    id,
+                    result: answered.result.clone(),
+                },
+                answered.text.clone(),
+            )],
+            delivery: answered.delivery,
+            waiters: Vec::new(),
+            idle: false,
+        });
+        true
+    }
+
     fn terminate(&self, message: &str, pending: &mut Waiters) {
         for (_, (_, abort)) in self.running.update(std::mem::take) {
             abort.abort();
@@ -1239,13 +1305,16 @@ impl Client {
         self.callbacks.set(HashMap::new());
         self.adoptions.set(HashMap::new());
         self.receipts.set(HashMap::new());
+        self.served.set(nanocode_sync::Map::new());
         self.answers.forget("");
         let uncertain = format!(
             "{message}; the dispatched operation has an unknown outcome and was not retried"
         );
         let unsent = format!("{message}; the operation was not dispatched");
         self.failure.set(Some(message.to_owned()));
-        for (id, waiter) in pending.drain() {
+        let mut ended: Vec<(u64, Waiter)> = pending.drain().collect();
+        ended.sort_unstable_by_key(|(id, _)| *id);
+        for (id, waiter) in ended {
             let result = if waiter.written.load(Ordering::SeqCst) {
                 uncertain.clone()
             } else {

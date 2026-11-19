@@ -107,6 +107,16 @@ pub trait HandCalls: Send + Sync + 'static {
     ) -> HostFuture<'a, Option<ToolOutput>> {
         Box::pin(async { None })
     }
+
+    fn call_once<'a>(
+        &'a self,
+        hand: &'a str,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        self.call(hand, name, input, context)
+    }
 }
 
 #[must_use]

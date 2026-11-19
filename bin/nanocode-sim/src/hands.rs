@@ -17,7 +17,7 @@ use nanocode_code_mode::embedded::{CodeModeHostError, HandCalls, HostFuture};
 use nanocode_code_mode::remote::{
     Carried, CodeModeExecutors, NOT_RECEIVED, PEER_CLOSED, RemoteBarrier, RemoteCatalog,
     RemoteCodeModeHost, RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation,
-    RemoteReply, RemoteTransport, output_to_wire,
+    RemoteReply, RemoteTransport, output_from_wire, output_to_wire,
 };
 use nanocode_code_mode::{ToolContext, ToolOutput, ToolOutputBody};
 use nanocode_durability_core::{
@@ -63,6 +63,8 @@ const RUNTIMES_MAX: usize = 4;
 const ATTACHES_QUEUED_MAX: usize = 64;
 const MS: u64 = 1_000_000;
 const FLEET_MUTATED: usize = 3;
+const CELL_PPM: u64 = 500_000;
+const CELL: &str = "cell";
 const FLEET_COMMIT_MS_MAX: u64 = 200;
 const UNSENT: [&str; 3] = [
     "not dispatched",
@@ -86,11 +88,12 @@ pub enum HandsMutation {
     FleetCrossHands,
     FleetRecoverNone,
     FleetSwallowUnsent,
+    FleetRedispatch,
     ResumeWaitingOnly,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -105,6 +108,7 @@ impl HandsMutation {
         Self::FleetCrossHands,
         Self::FleetRecoverNone,
         Self::FleetSwallowUnsent,
+        Self::FleetRedispatch,
         Self::ResumeWaitingOnly,
     ];
 
@@ -130,6 +134,7 @@ impl HandsMutation {
             Self::FleetCrossHands => "fleet_cross_hands",
             Self::FleetRecoverNone => "fleet_recover_none",
             Self::FleetSwallowUnsent => "fleet_swallow_unsent",
+            Self::FleetRedispatch => "fleet_redispatch",
             Self::ResumeWaitingOnly => "resume_waiting_only",
         }
     }
@@ -140,6 +145,7 @@ impl HandsMutation {
             | Self::FleetCrossHands
             | Self::FleetRecoverNone
             | Self::FleetSwallowUnsent
+            | Self::FleetRedispatch
                 if fleet == 1 =>
             {
                 FLEET_MUTATED
@@ -194,6 +200,7 @@ struct Script {
     commits: Vec<u64>,
     crashes: Vec<u64>,
     hands: Vec<usize>,
+    cells: Vec<bool>,
     schedules: Vec<Schedule>,
 }
 
@@ -231,12 +238,14 @@ impl Script {
         let drops = rng.range(0, DROPS_MAX);
         let drops = times(&mut rng, drops);
         let hands = vec![0; starts.len()];
+        let cells = vec![false; starts.len()];
         Self {
             starts,
             runs,
             commits,
             crashes,
             hands,
+            cells,
             schedules: vec![Schedule { restarts, drops }],
         }
     }
@@ -252,7 +261,17 @@ impl Script {
         let commits = (0..calls)
             .map(|_| rng.range(0, FLEET_COMMIT_MS_MAX) * MS)
             .collect();
-        let hands = (0..calls).map(|_| rng.pick(fleet)).collect();
+        let cells: Vec<bool> = (0..calls).map(|_| rng.chance(CELL_PPM)).collect();
+        let hands = cells
+            .iter()
+            .map(|cell| {
+                if *cell {
+                    1 + rng.pick(fleet - 1)
+                } else {
+                    rng.pick(fleet)
+                }
+            })
+            .collect();
         let crashes = rng.range(0, CRASHES_MAX);
         let crashes = times(&mut rng, crashes);
         let schedules = (0..fleet)
@@ -270,6 +289,7 @@ impl Script {
             commits,
             crashes,
             hands,
+            cells,
             schedules,
         }
     }
@@ -284,7 +304,10 @@ impl Script {
         );
         match self.schedules.len() {
             1 => shape,
-            fleet => format!("{shape} hands={fleet}"),
+            fleet => format!(
+                "{shape} hands={fleet} cells={}",
+                self.cells.iter().filter(|cell| **cell).count()
+            ),
         }
     }
 }
@@ -740,6 +763,7 @@ struct Call {
     state: CallState,
     exposed: bool,
     hand: usize,
+    cell: bool,
 }
 
 #[derive(Default)]
@@ -748,6 +772,10 @@ struct Hand {
     running: BTreeMap<u64, (usize, u64, Value)>,
     retained: BTreeMap<u64, Value>,
     executions: BTreeMap<usize, Vec<Value>>,
+    callbacks: BTreeMap<u64, usize>,
+    held: Vec<u64>,
+    asked: Vec<usize>,
+    next_callback: u64,
 }
 
 struct Slot {
@@ -818,11 +846,19 @@ impl World {
         hand.runtime += 1;
         hand.running.clear();
         hand.retained.clear();
-        for call in self.calls.borrow_mut().iter_mut() {
+        let cells: Vec<usize> = std::mem::take(&mut hand.callbacks).into_values().collect();
+        let mut calls = self.calls.borrow_mut();
+        for call in calls.iter_mut() {
             if call.hand == at && !matches!(call.state, CallState::Committed(_)) {
                 call.exposed = true;
             }
         }
+        for index in cells {
+            self.note(format!("call {index} dies with its cell"));
+            calls[index].exposed = true;
+            calls[index].state = CallState::Committed(Outcome::Unknown);
+        }
+        drop(calls);
         self.stats.borrow_mut().restarts += 1;
         self.note(format!("{} restarts as runtime {}", slot.key, hand.runtime));
         true
@@ -854,8 +890,9 @@ impl World {
                 if hand.running.contains_key(&id) {
                     return;
                 }
-                let index: usize = context.call_id.parse().expect("calls are numbered");
-                if !durable_step(&self.log, index) {
+                let index = numbered(&context.call_id);
+                let cell = self.calls.borrow()[index].cell;
+                if !cell && !durable_step(&self.log, index) {
                     self.fail(
                         "folded",
                         format!("call {index} reached the hand before its step was durable"),
@@ -891,7 +928,27 @@ impl World {
                     hand.retained.remove(&id);
                 }
             }
+            RemoteFrame::CallbackResult { id, result } => {
+                let Some(index) = hand.callbacks.remove(&id) else {
+                    return;
+                };
+                let outcome = match result {
+                    Ok(value) => output_from_wire(value)
+                        .map_or(Outcome::Unknown, |output| Self::output(&output)),
+                    Err(text) if UNSENT.iter().any(|unsent| text.contains(unsent)) => {
+                        Outcome::NotDispatched
+                    }
+                    Err(_) => Outcome::Unknown,
+                };
+                self.note(format!("call {index} answers its cell with {outcome:?}"));
+                self.calls.borrow_mut()[index].state = CallState::Committed(outcome);
+            }
             RemoteFrame::Resume { pending } => {
+                for id in std::mem::take(&mut hand.held) {
+                    if let Some(index) = hand.callbacks.get(&id) {
+                        let _ = out.send(self.callback(id, *index));
+                    }
+                }
                 let mut pending = pending;
                 if self.store.mutation == HandsMutation::ResumeWaitingOnly {
                     let read = slot.read.read(BTreeSet::clone);
@@ -911,6 +968,59 @@ impl World {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn callback(&self, id: u64, index: usize) -> String {
+        let hand = self.slots[self.calls.borrow()[index].hand].key.clone();
+        RemoteFrame::Callback {
+            id,
+            name: "run".to_owned(),
+            input: json!({}),
+            freeform: false,
+            context: RemoteContext::new(
+                SESSION.to_owned(),
+                format!("{CELL}/code-{index}"),
+                Some(TURN.to_owned()),
+            ),
+            hand: Some(hand),
+            compact: false,
+            output_prefix: false,
+            answers: false,
+            asked: false,
+        }
+        .encode(FRAME_BYTES_MAX)
+        .expect("a simulated callback fits its frame")
+    }
+
+    fn ask(&self, out: &mpsc::UnboundedSender<String>) {
+        let now = self.now();
+        let due: Vec<usize> = {
+            let hand = self.slots[0].hand.borrow();
+            self.calls
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(index, call)| {
+                    call.cell
+                        && matches!(call.state, CallState::Fresh)
+                        && self.script.starts[*index] <= now
+                        && !hand.asked.contains(index)
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        for index in due {
+            let id = {
+                let mut hand = self.slots[0].hand.borrow_mut();
+                hand.asked.push(index);
+                let id = hand.next_callback;
+                hand.next_callback += 1;
+                hand.callbacks.insert(id, index);
+                id
+            };
+            self.note(format!("the cell asks for call {index} as callback {id}"));
+            let _ = out.send(self.callback(id, index));
         }
     }
 
@@ -952,6 +1062,9 @@ impl World {
                 return;
             }
             self.finish(at, &out);
+            if at == 0 && self.fleet() {
+                self.ask(&out);
+            }
             nanocode_sync::select! {
                 text = incoming.recv() => match text {
                     Some(text) => self.receive(at, &text, &out),
@@ -991,12 +1104,24 @@ impl World {
                 read: Arc::clone(&slot.read),
             };
             let brain = async {
+                {
+                    let mut hand = slot.hand.borrow_mut();
+                    hand.held = hand.callbacks.keys().copied().collect();
+                }
                 match acceptor.attach(slot.key.clone(), catalog, link).await {
                     Ok(attached) => attached.ended().await,
                     Err(error) => self.note(format!("attach refused: {error}")),
                 }
             };
             nanocode_sync::future::join(brain, self.connection(at, to_brain, from_brain)).await;
+        }
+    }
+
+    async fn adopt(&self, primary: &AcceptorRoute) {
+        let origin = RemoteContext::new(SESSION.to_owned(), CELL.to_owned(), Some(TURN.to_owned()));
+        while !self.done() {
+            primary.adopt(&origin, Vec::new());
+            self.clock.sleep(TICK).await;
         }
     }
 
@@ -1140,6 +1265,9 @@ impl World {
     }
 
     async fn session_call(&self, via: &Via<'_>, log: &Arc<OneLog>, index: usize) {
+        if self.calls.borrow()[index].cell {
+            return;
+        }
         let state = self.calls.borrow()[index].state.clone();
         let outcome = match state {
             CallState::Committed(_) => return,
@@ -1216,6 +1344,32 @@ impl World {
     }
 }
 
+struct Redispatch(Arc<dyn HandCalls>);
+
+impl HandCalls for Redispatch {
+    fn here(&self, hand: &str) -> bool {
+        self.0.here(hand)
+    }
+
+    fn call<'a>(
+        &'a self,
+        hand: &'a str,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        self.0.call(hand, name, input, context)
+    }
+}
+
+fn numbered(call_id: &str) -> usize {
+    call_id
+        .rsplit_once("/code-")
+        .map_or(call_id, |(_, index)| index)
+        .parse()
+        .expect("calls are numbered")
+}
+
 fn options(fleet: usize) -> AcceptorOptions {
     AcceptorOptions {
         path: "/".to_owned(),
@@ -1288,11 +1442,19 @@ async fn process(world: &World) {
         executors.insert(slot.key.clone(), Arc::new(host));
     }
     let hands = executors.calls();
+    let primary = acceptor.route(Arc::new(|| Box::pin(async { Some("hand-0".to_owned()) })));
+    let routed: Arc<dyn HandCalls> = if world.store.mutation == HandsMutation::FleetRedispatch {
+        Arc::new(Redispatch(Arc::clone(&hands)))
+    } else {
+        Arc::clone(&hands)
+    };
+    primary.route_hands(routed);
     let via = Via::Hands(&hands);
     let calls = (0..world.script.starts.len()).map(|index| world.session_call(&via, &log, index));
     let sessions = nanocode_sync::join_in_order(calls);
     let drivers = (0..world.slots.len()).map(|at| world.hand(at, &acceptor));
-    nanocode_sync::future::join(sessions, nanocode_sync::join_in_order(drivers)).await;
+    let work = nanocode_sync::future::join(sessions, nanocode_sync::join_in_order(drivers));
+    nanocode_sync::future::join(work, world.adopt(&primary)).await;
 }
 
 pub struct HandsOutcome {
@@ -1311,10 +1473,12 @@ fn simulate(seed: u64, mutation: HandsMutation, fleet: usize) -> HandsOutcome {
     let calls = script
         .hands
         .iter()
-        .map(|hand| Call {
+        .zip(&script.cells)
+        .map(|(hand, cell)| Call {
             state: CallState::Fresh,
             exposed: false,
             hand: *hand,
+            cell: *cell,
         })
         .collect();
     let slots = script

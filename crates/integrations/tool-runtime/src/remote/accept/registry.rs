@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use nanocode_http::StatusCode;
 use nanocode_http::header::HeaderMap;
-use nanocode_sync::{Atom, Slot, mpsc, watch};
+use nanocode_sync::{Atom, FutureExt, Slot, mpsc, watch};
 use serde_json::Value;
 
 use super::requests::{HandRequests, PendingRequest};
@@ -282,6 +282,12 @@ struct Runtime {
     socket: Option<u64>,
 }
 
+#[derive(Clone, Default)]
+struct Bound {
+    hands: Option<Arc<dyn HandCalls>>,
+    adopted: HashMap<String, (RemoteContext, Vec<Arc<dyn Tool>>)>,
+}
+
 pub struct Acceptor {
     pub(super) options: AcceptorOptions,
     pub(super) authorize: Authorize,
@@ -293,6 +299,7 @@ pub struct Acceptor {
     sockets: AtomicU64,
     changes: Arc<Changes>,
     attached: mpsc::Sender<String>,
+    bindings: Atom<HashMap<String, Bound>>,
 }
 
 pub struct Attached {
@@ -375,6 +382,7 @@ impl Acceptor {
             sockets: AtomicU64::new(0),
             changes,
             attached,
+            bindings: Atom::default(),
         };
         (Arc::new(acceptor), attaches)
     }
@@ -444,6 +452,23 @@ impl Acceptor {
             resolve,
             last: Atom::default(),
             routed: Atom::default(),
+        }
+    }
+
+    fn bind(&self, key: &str, client: &RemoteClient) {
+        let (hands, adopted) = self.bindings.read(|bindings| {
+            bindings.get(key).map_or((None, Vec::new()), |binding| {
+                (
+                    binding.hands.clone(),
+                    binding.adopted.values().cloned().collect::<Vec<_>>(),
+                )
+            })
+        });
+        if let Some(hands) = hands {
+            client.route_hands(hands);
+        }
+        for (context, tools) in adopted {
+            client.adopt(&context, tools);
         }
     }
 
@@ -556,6 +581,7 @@ impl Acceptor {
         if let Some(old) = replaced {
             old.redial.close();
         }
+        self.bind(&key, &entry.client);
         for (_, reply) in resumed {
             nanocode_platform::spawn(async move {
                 drop(reply.await);
@@ -658,6 +684,33 @@ pub struct AcceptorRoute {
 }
 
 impl AcceptorRoute {
+    fn key(&self) -> Option<String> {
+        if let Some(key) = Option::clone(&self.last.get()) {
+            return Some(key);
+        }
+        let key = (self.resolve)().now_or_never().flatten()?;
+        self.last.set(Some(key.clone()));
+        Some(key)
+    }
+
+    fn bound(&self, key: &str, change: impl Fn(&mut Bound)) {
+        self.acceptor
+            .bindings
+            .update(|bindings| change(bindings.entry(key.to_owned()).or_default()));
+    }
+
+    fn unadopt(&self, operation: &RemoteOperation) {
+        if let RemoteOperation::Cancel { session_id } = operation
+            && let Some(key) = Option::clone(&self.last.get())
+        {
+            self.acceptor.bindings.update(|bindings| {
+                if let Some(binding) = bindings.get_mut(&key) {
+                    binding.adopted.remove(session_id);
+                }
+            });
+        }
+    }
+
     fn current(&self) -> Result<RemoteClient, CodeModeHostError> {
         let last = Option::clone(&self.last.get());
         last.and_then(|key| self.acceptor.live(&key))
@@ -671,11 +724,22 @@ impl AcceptorRoute {
         loop {
             if let Some(key) = (self.resolve)().await {
                 let live = self.acceptor.live(&key);
-                self.last.set(Some(key));
-                if let Some((client, _)) = live {
-                    if let Some(hands) = Option::clone(&self.routed.get()) {
+                self.last.set(Some(key.clone()));
+                if let Some(hands) = Option::clone(&self.routed.get()) {
+                    let bound = self.acceptor.bindings.read(|bindings| {
+                        bindings
+                            .get(&key)
+                            .and_then(|binding| binding.hands.as_ref())
+                            .is_some_and(|bound| Arc::ptr_eq(bound, &hands))
+                    });
+                    if !bound {
+                        self.bound(&key, |binding| binding.hands = Some(Arc::clone(&hands)));
+                    }
+                    if let Some((client, _)) = &live {
                         client.route_hands(hands);
                     }
+                }
+                if let Some((client, _)) = live {
                     return Ok(client);
                 }
             }
@@ -702,6 +766,7 @@ impl RemoteTransport for AcceptorRoute {
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
         Box::pin(async move {
             let client = self.client().await?;
+            self.unadopt(&operation);
             let observer = observer.map(|observer| observer as &mut dyn CodeModeObserver);
             client.request(operation, local_tools, observer).await
         })
@@ -745,6 +810,18 @@ impl RemoteTransport for AcceptorRoute {
     }
 
     fn adopt(&self, context: &RemoteContext, tools: Vec<Arc<dyn Tool>>) {
+        let Some(key) = self.key() else {
+            return;
+        };
+        let kept = RemoteContext {
+            history: Arc::default(),
+            ..context.clone()
+        };
+        self.bound(&key, |binding| {
+            binding
+                .adopted
+                .insert(context.session_id.clone(), (kept.clone(), tools.clone()));
+        });
         if let Ok(client) = self.current() {
             client.adopt(context, tools);
         }
@@ -757,13 +834,17 @@ impl RemoteTransport for AcceptorRoute {
     }
 
     fn route_hands(&self, hands: Arc<dyn HandCalls>) {
-        if let Ok(client) = self.current() {
-            client.route_hands(Arc::clone(&hands));
+        self.routed.set(Some(Arc::clone(&hands)));
+        if let Some(key) = self.key() {
+            self.bound(&key, |binding| binding.hands = Some(Arc::clone(&hands)));
         }
-        self.routed.set(Some(hands));
+        if let Ok(client) = self.current() {
+            client.route_hands(hands);
+        }
     }
 
     fn notify(&self, operation: RemoteOperation) -> Result<(), CodeModeHostError> {
+        self.unadopt(&operation);
         self.current()?.notify(operation)
     }
 

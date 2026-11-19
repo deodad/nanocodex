@@ -266,6 +266,34 @@ impl HandCalls for ExecutorCalls {
             }
         })
     }
+
+    fn call_once<'a>(
+        &'a self,
+        hand: &'a str,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            let host = self
+                .state
+                .upgrade()
+                .and_then(|state| state.read(|state| state.executors.get(hand).cloned()));
+            if let Some(host) = host {
+                match host.recover_call(context).await {
+                    Ok(Some(output)) => return output,
+                    Ok(None) => {
+                        return ToolOutput::error(format!(
+                            "hand `{hand}`: an earlier brain dispatched this call and its outcome is unknown; it was not retried"
+                        ));
+                    }
+                    Err(error) if error.is_unsent() => {}
+                    Err(error) => return ToolOutput::error(format!("hand `{hand}`: {error}")),
+                }
+            }
+            self.call(hand, name, input, context).await
+        })
+    }
 }
 
 pub struct HandsTool(CodeModeExecutors);
