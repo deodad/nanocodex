@@ -214,6 +214,7 @@ enum Outgoing {
         idle: bool,
     },
     Forget(u64),
+    Probe(u64),
     Boundary(Frame),
 }
 
@@ -720,6 +721,13 @@ impl RemoteClient {
         (Self { client }, driver, resumed)
     }
 
+    pub fn probe(&self, id: u64) -> Result<(), CodeModeHostError> {
+        self.client
+            .outgoing
+            .send(Outgoing::Probe(id))
+            .map_err(error)
+    }
+
     pub fn ack(&self, ids: Vec<u64>) -> Result<(), CodeModeHostError> {
         self.client
             .outgoing
@@ -965,6 +973,43 @@ impl Client {
             written: Arc::clone(&waiter.written),
         };
         Some((kept, orphaned(Arc::downgrade(self), id, receiver)))
+    }
+
+    fn probe(
+        self: &Arc<Self>,
+        id: u64,
+        pending: &mut Waiters,
+        callbacks: &mut FuturesUnordered<HostFuture<'static, ()>>,
+    ) -> Option<Frame> {
+        if self.ledger.is_none()
+            || self.resumes.is_none()
+            || pending.contains_key(&id)
+            || self.unacked.read(|unacked| unacked.contains(&id))
+        {
+            return None;
+        }
+        let mut ids: Vec<u64> = pending
+            .iter()
+            .filter(|(_, waiter)| waiter.written.load(Ordering::SeqCst))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.extend(
+            self.unacked
+                .read(|unacked| unacked.iter().copied().collect::<Vec<_>>()),
+        );
+        ids.push(id);
+        ids.sort_unstable();
+        ids.dedup();
+        let (replies, receiver) = mpsc::unbounded_channel();
+        pending.insert(
+            id,
+            Waiter {
+                replies,
+                written: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        callbacks.push(orphaned(Arc::downgrade(self), id, receiver));
+        Some(Frame::Resume { pending: ids })
     }
 
     fn adoption(&self, session_id: &str) -> Adoption {
@@ -1659,6 +1704,14 @@ async fn drive(
                                     callbacks.push(recorder);
                                 }
                             }
+                            Some(Outgoing::Probe(id)) => {
+                                if let Some(client) = client.upgrade()
+                                    && let Some(resume) =
+                                        client.probe(id, &mut pending, &mut callbacks)
+                                {
+                                    batch.push((resume, None));
+                                }
+                            }
                             Some(Outgoing::Boundary(frame)) => hold(&mut boundaries, frame),
                         }
                     }
@@ -1749,7 +1802,7 @@ async fn drive(
             Outgoing::Forget(id) => {
                 pending.remove(&id);
             }
-            Outgoing::Boundary(_) => {}
+            Outgoing::Probe(_) | Outgoing::Boundary(_) => {}
         }
     }
     let message = result.map_or_else(|issue| issue.to_string(), |()| LOCAL_CLOSED.to_owned());

@@ -631,6 +631,17 @@ impl Acceptor {
             .read(|runtimes| runtimes.get(key).map(|runtime| runtime.recorded.clone()))
     }
 
+    fn probe(&self, record: &PendingRequest) -> Option<u64> {
+        let (client, socket) = self.runtimes.read(|runtimes| {
+            let runtime = runtimes
+                .get(&record.key)
+                .filter(|runtime| runtime.recorded == record.runtime)?;
+            Some((runtime.client.clone(), runtime.socket?))
+        })?;
+        client.probe(record.id).ok()?;
+        Some(socket)
+    }
+
     async fn recover(
         &self,
         session_id: &str,
@@ -639,6 +650,7 @@ impl Acceptor {
         let started = nanocode_platform::now();
         let mut changes = self.changes();
         let mut away = None;
+        let mut probed = None;
         loop {
             let record = self
                 .requests
@@ -654,6 +666,12 @@ impl Acceptor {
             let deadline = match self.recorded_runtime(&record.key) {
                 Some(runtime) if runtime == record.runtime => {
                     away = None;
+                    let socket = self.runtimes.read(|runtimes| {
+                        runtimes.get(&record.key).and_then(|runtime| runtime.socket)
+                    });
+                    if socket.is_some() && socket != probed {
+                        probed = self.probe(&record).or(probed);
+                    }
                     self.options
                         .operation_timeout
                         .map(|timeout| started + timeout)

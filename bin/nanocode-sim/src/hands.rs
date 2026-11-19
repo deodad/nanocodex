@@ -6,7 +6,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -55,6 +55,7 @@ const EVENT_MS_MAX: u64 = 1_500;
 const RESTART_PPM: u64 = 300_000;
 const REDIAL_MS_MAX: u64 = 40;
 const WRITE_MS_MAX: u64 = 3;
+const STALL_EVERY: u64 = 3;
 const TICK: Duration = Duration::from_millis(1);
 const GRACE: Duration = Duration::from_secs(5);
 const SETTLE_HORIZON_MS: u64 = 60_000;
@@ -92,10 +93,11 @@ pub enum HandsMutation {
     FleetRedispatch,
     ResumeWaitingOnly,
     ReopenOrphaned,
+    ReopenUnprobed,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 18] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -113,6 +115,7 @@ impl HandsMutation {
         Self::FleetRedispatch,
         Self::ResumeWaitingOnly,
         Self::ReopenOrphaned,
+        Self::ReopenUnprobed,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -140,12 +143,13 @@ impl HandsMutation {
             Self::FleetRedispatch => "fleet_redispatch",
             Self::ResumeWaitingOnly => "resume_waiting_only",
             Self::ReopenOrphaned => "reopen_orphaned",
+            Self::ReopenUnprobed => "reopen_unprobed",
         }
     }
 
     const fn options(self, options: HandsOptions) -> HandsOptions {
         match self {
-            Self::ReopenOrphaned => HandsOptions {
+            Self::ReopenOrphaned | Self::ReopenUnprobed => HandsOptions {
                 reopen: true,
                 ..options
             },
@@ -201,6 +205,7 @@ pub struct HandsStats {
     pub retained: u64,
     pub reopened: u64,
     pub orphaned: u64,
+    pub stalled: u64,
 }
 
 impl HandsStats {
@@ -218,6 +223,7 @@ impl HandsStats {
         self.retained += other.retained;
         self.reopened += other.reopened;
         self.orphaned += other.orphaned;
+        self.stalled += other.stalled;
     }
 }
 
@@ -369,6 +375,8 @@ struct Store {
     writes: AtomicU64,
     abandoned: Atom<BTreeSet<(String, u64)>>,
     orphaned: AtomicU64,
+    stalling: AtomicBool,
+    stalled: AtomicU64,
     seed: u64,
     mutation: HandsMutation,
 }
@@ -400,6 +408,17 @@ impl Store {
         self.rows.update(|rows| {
             rows.insert(at.clone(), row.clone());
         });
+    }
+
+    async fn stall(&self, request: &PendingRequest) {
+        if self.stalling.load(Ordering::Relaxed)
+            && fnv(self.seed, request.call_id.as_bytes()).is_multiple_of(STALL_EVERY)
+        {
+            self.stalled.fetch_add(1, Ordering::Relaxed);
+            while self.stalling.load(Ordering::Relaxed) {
+                nanocode_platform::sleep(TICK).await;
+            }
+        }
     }
 
     fn abandon(&self) {
@@ -477,10 +496,11 @@ impl HandRequests for Store {
                 host: std::ptr::from_ref(self) as usize,
                 statements: vec![(SENT, params)],
             };
-            if barrier.carry(carried).await? {
-                return Ok(());
+            if !barrier.carry(carried).await? {
+                self.sent(request).await?;
             }
-            self.sent(request).await
+            self.stall(request).await;
+            Ok(())
         })
     }
 
@@ -843,6 +863,7 @@ struct Hand {
     held: Vec<u64>,
     asked: Vec<usize>,
     next_callback: u64,
+    seen: BTreeSet<u64>,
 }
 
 struct Slot {
@@ -982,6 +1003,7 @@ impl World {
                     json!(label)
                 };
                 let done = self.now() + self.script.runs[index];
+                hand.seen.insert(id);
                 hand.running.insert(id, (index, done, value));
                 self.note(format!("{} runs call {index} as request {id}", slot.key));
             }
@@ -1038,6 +1060,11 @@ impl World {
                     if let Some(value) = hand.retained.get(&id) {
                         let _ = out.send(Self::reply(id, value.clone()));
                     } else if !hand.running.contains_key(&id) {
+                        if !hand.seen.contains(&id)
+                            && self.store.mutation == HandsMutation::ReopenUnprobed
+                        {
+                            continue;
+                        }
                         let refused = RemoteFrame::Reply {
                             id,
                             result: Err(NOT_RECEIVED.to_owned()),
@@ -1529,13 +1556,19 @@ async fn runtimes(world: &World, acceptor: &Arc<Acceptor>, log: Arc<OneLog>) {
     loop {
         let reopen = world.reopen.take().filter(|at| *at > world.now());
         let Some(at) = reopen else {
+            world.store.stalling.store(false, Ordering::Relaxed);
             runtime(world, acceptor, &log).await;
             return;
         };
         let until = at - world.now();
+        world.store.stalling.store(true, Ordering::Relaxed);
         nanocode_sync::select! {
             () = runtime(world, acceptor, &log) => return,
             () = world.clock.sleep(Duration::from_nanos(until)) => {}
+        }
+        world.store.stalling.store(false, Ordering::Relaxed);
+        if log.settle_deferred().await.is_err() {
+            world.note("the brain could not settle its dropped runtime's log".to_owned());
         }
         world.store.abandon();
         world.stats.borrow_mut().reopened += 1;
@@ -1615,6 +1648,8 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
         writes: AtomicU64::new(0),
         abandoned: Atom::default(),
         orphaned: AtomicU64::new(0),
+        stalling: AtomicBool::new(false),
+        stalled: AtomicU64::new(0),
         seed,
         mutation,
     });
@@ -1677,6 +1712,7 @@ fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsO
     world.stats.borrow_mut().folded = world.log.folded.load(Ordering::Relaxed);
     world.stats.borrow_mut().rode = world.log.rode.load(Ordering::Relaxed);
     world.stats.borrow_mut().orphaned = world.store.orphaned.load(Ordering::Relaxed);
+    world.stats.borrow_mut().stalled = world.store.stalled.load(Ordering::Relaxed);
     let trace = world.trace.borrow();
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
     for line in trace.iter() {
