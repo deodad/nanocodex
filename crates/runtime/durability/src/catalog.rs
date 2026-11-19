@@ -1050,6 +1050,23 @@ mod store {
             loading::turn(self, id, request_id).await
         }
 
+        pub async fn kept_steers(&self, id: &str, request_id: &str) -> Result<Vec<String>> {
+            let Some(state) = self.peek(id).await? else {
+                return Ok(Vec::new());
+            };
+            Ok(state
+                .operation(request_id)
+                .map(|operation| {
+                    operation
+                        .steer_receipts
+                        .iter()
+                        .filter(|(_, receipt)| !receipt.withdrawn)
+                        .map(|(message_id, _)| message_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
+
         /// Operation `request_id`'s stored continuation (the head's first
         /// pending operation's when `None`), read and hydrated from the store
         /// as its family's execution reads it, without an owner or a claim:

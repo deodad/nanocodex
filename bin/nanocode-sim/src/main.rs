@@ -1,3 +1,4 @@
+mod afterpass;
 mod agents;
 #[cfg(unix)]
 mod alloc;
@@ -57,6 +58,7 @@ use crate::{
     hands::{HandsMutation, HandsStats},
     cellcalls::{CellCallsMutation, CellCallsStats},
     longthread::{LongThreadMutation, LongThreadStats},
+    afterpass::{AfterPassMutation, AfterPassStats},
     sync::{SyncMutation, SyncStats},
     tasks::{TasksMutation, TasksStats},
     websocket::{WebSocketMutation, WebSocketStats},
@@ -83,6 +85,7 @@ enum Scenario {
     Hands,
     CellCalls,
     LongThread,
+    AfterPass,
     Capture,
     Executor,
     Dns,
@@ -104,6 +107,7 @@ struct Args {
     hands: HandsMutation,
     cell_calls: CellCallsMutation,
     long_thread: LongThreadMutation,
+    after_pass: AfterPassMutation,
     tasks: TasksMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
@@ -119,7 +123,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|capture|executor|dns] [--ops N] [--twice] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|after_pass|capture|executor|dns] [--ops N] [--twice] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -130,6 +134,7 @@ fn usage() -> ExitCode {
        hands: [--mutation {}]
        cell_calls: [--mutation {}]
        long_thread: [--mutation {}]
+       after_pass: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
        executor: [--mutation {}]
        dns: [--mutation cut_answer|drop_search]",
@@ -147,6 +152,7 @@ fn usage() -> ExitCode {
         HandsMutation::names(),
         CellCallsMutation::names(),
         LongThreadMutation::names(),
+        AfterPassMutation::names(),
         TasksMutation::names()
     );
     ExitCode::from(2)
@@ -198,6 +204,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut hands = HandsMutation::None;
     let mut cell_calls = CellCallsMutation::None;
     let mut long_thread = LongThreadMutation::None;
+    let mut after_pass = AfterPassMutation::None;
     let mut tasks = TasksMutation::None;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
@@ -246,6 +253,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "hands" => Scenario::Hands,
                     "cell_calls" => Scenario::CellCalls,
                     "long_thread" => Scenario::LongThread,
+                    "after_pass" => Scenario::AfterPass,
                     "executor" => Scenario::Executor,
                     #[cfg(unix)]
                     "capture" => Scenario::Capture,
@@ -288,6 +296,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::Hands, Some(name)) => hands = HandsMutation::parse(name)?,
         (Scenario::CellCalls, Some(name)) => cell_calls = CellCallsMutation::parse(name)?,
         (Scenario::LongThread, Some(name)) => long_thread = LongThreadMutation::parse(name)?,
+        (Scenario::AfterPass, Some(name)) => after_pass = AfterPassMutation::parse(name)?,
         (Scenario::Executor, Some(name)) => tasks = TasksMutation::parse(name)?,
         #[cfg(unix)]
         (Scenario::Capture, Some(name)) => capture = capture::CaptureMutation::parse(name)?,
@@ -329,6 +338,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         hands,
         cell_calls,
         long_thread,
+        after_pass,
         tasks,
         #[cfg(unix)]
         alloc,
@@ -366,6 +376,9 @@ fn replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::LongThread {
         return longthread::replay(seed, args.long_thread);
+    }
+    if args.scenario == Scenario::AfterPass {
+        return afterpass::replay(seed, args.after_pass);
     }
     if args.scenario == Scenario::Agents {
         let mut command = format!("nanocode-sim --scenario agents --seed {seed}");
@@ -685,6 +698,7 @@ fn mutations() -> ExitCode {
     add("hands", HandsMutation::names());
     add("cell_calls", CellCallsMutation::names());
     add("long_thread", LongThreadMutation::names());
+    add("after_pass", AfterPassMutation::names());
     add("executor", TasksMutation::names());
     #[cfg(unix)]
     {
@@ -752,6 +766,7 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::Hands && args.hands != HandsMutation::None)
         || (args.scenario == Scenario::CellCalls && args.cell_calls != CellCallsMutation::None)
         || (args.scenario == Scenario::LongThread && args.long_thread != LongThreadMutation::None)
+        || (args.scenario == Scenario::AfterPass && args.after_pass != AfterPassMutation::None)
         || (args.scenario == Scenario::Executor && args.tasks != TasksMutation::None)
         || alloc_experiment(&args);
     let (mut passed, mut failed) = (0_u64, 0_u64);
@@ -767,6 +782,7 @@ fn main() -> ExitCode {
     let mut hands_totals = HandsStats::default();
     let mut cell_calls_totals = CellCallsStats::default();
     let mut long_thread_totals = LongThreadStats::default();
+    let mut after_pass_totals = AfterPassStats::default();
     let mut tasks_totals = TasksStats::default();
     #[cfg(unix)]
     let mut capture_totals = capture::CaptureStats::default();
@@ -824,6 +840,13 @@ fn main() -> ExitCode {
                 args.twice,
                 args.options.verbose,
                 &mut long_thread_totals,
+            ),
+            Scenario::AfterPass => afterpass::judge(
+                seed,
+                args.after_pass,
+                args.twice,
+                args.options.verbose,
+                &mut after_pass_totals,
             ),
             Scenario::Hands => hands::judge_seed(
                 seed,
@@ -931,6 +954,9 @@ fn main() -> ExitCode {
     }
     if args.scenario == Scenario::LongThread {
         return longthread::report(&args.seeds, passed, failed, args.twice, args.long_thread, &long_thread_totals);
+    }
+    if args.scenario == Scenario::AfterPass {
+        return afterpass::report(&args.seeds, passed, failed, args.twice, args.after_pass, &after_pass_totals);
     }
     if args.scenario == Scenario::Executor {
         return tasks::report(&args.seeds, passed, failed, args.twice, args.tasks, &tasks_totals);

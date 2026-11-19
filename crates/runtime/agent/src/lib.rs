@@ -31,7 +31,8 @@ pub use session_log::{
     Submitted, TurnRecord, TurnRetry, TurnState, submission_digest,
 };
 pub use turn_inbox::{
-    Attach, Delivery, Driven, Halt, InboxError, InboxHost, MovedQueued, Next, PassEnd, TurnInbox,
-    Wake,
+    AfterPass, Attach, Delivery, Driven, FinishedPass, Halt, InboxError, InboxHost, MovedQueued,
+    Next, PassContext, PassEnd, PassOrigin, PassOutcome, PassPhase, PassPolicy, PassRecord,
+    PassSpec, PolicyError, PolicyTurn, TurnInbox, Wake,
 };
 pub use turn_log::{EventLog, Recording, TurnLog, Verdict};

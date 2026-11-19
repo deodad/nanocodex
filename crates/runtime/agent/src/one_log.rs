@@ -33,7 +33,7 @@ use crate::{
         TurnRecord, TurnRetry, TurnState, edited, now, submission_digest,
     },
     stored_event::Stored,
-    turn_inbox::Envelope,
+    turn_inbox::{Envelope, PassRecord},
     turn_log::{EventLog, Logged, Recording, TurnLog},
 };
 
@@ -1183,6 +1183,90 @@ impl TurnLog for OneLog {
         digest: &'a str,
     ) -> Logged<'a, Option<(TurnRecord, LoggedEvent)>> {
         Box::pin(Self::withdraw_steered(self, request_id, digest))
+    }
+
+    fn pass_record<'a>(&'a self, request_id: &'a str) -> Logged<'a, Option<PassRecord>> {
+        Box::pin(async move { self.host_value(&pass_key(request_id)).await })
+    }
+
+    fn pass_owner<'a>(&'a self, pass_id: &'a str) -> Logged<'a, Option<String>> {
+        Box::pin(async move { self.host_value(&pass_owner_key(pass_id)).await })
+    }
+
+    fn open_passes(&self) -> Logged<'_, Vec<String>> {
+        Box::pin(async move {
+            Ok(self
+                .host_value::<Vec<String>>(OPEN_PASSES)
+                .await?
+                .unwrap_or_default())
+        })
+    }
+
+    fn save_pass_record<'a>(&'a self, record: &'a PassRecord) -> Logged<'a, ()> {
+        Box::pin(Self::save_pass_record(self, record))
+    }
+}
+
+const OPEN_PASSES: &str = "nanocode.passes.open";
+
+fn pass_key(request_id: &str) -> String {
+    format!("nanocode.pass.request/{request_id}")
+}
+
+fn pass_owner_key(pass_id: &str) -> String {
+    format!("nanocode.pass.owner/{pass_id}")
+}
+
+fn host_decode<T: serde::de::DeserializeOwned>(key: &str, raw: &str) -> Result<T, StoreError> {
+    serde_json::from_str(raw).map_err(|error| {
+        StoreError::Backend(format!("the host record {key} does not decode: {error}"))
+    })
+}
+
+impl OneLog {
+    async fn host_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let raw = self
+            .log
+            .read(|fold| fold.host(key).map(|raw| raw.get().to_owned()))
+            .await;
+        raw.as_deref().map(|raw| host_decode(key, raw)).transpose()
+    }
+
+    async fn save_pass_record(&self, record: &PassRecord) -> Result<(), StoreError> {
+        let mut lease = self.log.lease().await;
+        let mut open: Vec<String> = lease
+            .fold()
+            .host(OPEN_PASSES)
+            .map(|raw| host_decode(OPEN_PASSES, raw.get()))
+            .transpose()?
+            .unwrap_or_default();
+        let listed = open.contains(&record.request_id);
+        let keep = record.origin == crate::turn_inbox::PassOrigin::Live && record.is_open();
+        if keep && !listed {
+            open.push(record.request_id.clone());
+        } else if !keep && listed {
+            open.retain(|id| id != &record.request_id);
+        }
+        lease.push(Record::Host {
+            key: pass_key(&record.request_id),
+            value: raw(record)?,
+        })?;
+        for pass in &record.passes {
+            lease.push(Record::Host {
+                key: pass_owner_key(pass),
+                value: raw(&record.request_id)?,
+            })?;
+        }
+        if keep != listed {
+            lease.push(Record::Host {
+                key: OPEN_PASSES.to_owned(),
+                value: raw(&open)?,
+            })?;
+        }
+        lease.commit(Point::Call).await.map(drop)
     }
 }
 

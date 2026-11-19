@@ -7,6 +7,7 @@ use crate::{
     SessionEvent,
     durability::StoreError,
     session_log::{LoggedEvent, Started, TurnRecord, TurnState},
+    turn_inbox::PassRecord,
 };
 
 pub type Logged<'a, T> = HostFuture<'a, Result<T, StoreError>>;
@@ -77,4 +78,24 @@ pub trait TurnLog: EventLog {
         request_id: &'a str,
         digest: &'a str,
     ) -> Logged<'a, Option<(TurnRecord, LoggedEvent)>>;
+
+    fn pass_record<'a>(&'a self, _request_id: &'a str) -> Logged<'a, Option<PassRecord>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn pass_owner<'a>(&'a self, _pass_id: &'a str) -> Logged<'a, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn open_passes(&self) -> Logged<'_, Vec<String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn save_pass_record<'a>(&'a self, _record: &'a PassRecord) -> Logged<'a, ()> {
+        Box::pin(async {
+            Err(StoreError::Backend(
+                "this turn log does not store after-pass records".to_owned(),
+            ))
+        })
+    }
 }

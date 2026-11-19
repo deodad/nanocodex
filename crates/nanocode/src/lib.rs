@@ -247,11 +247,12 @@ pub use nanocode_agent::{
 
 pub mod session_host {
     pub use nanocode_agent::{
-        Attach, Base, Delivery, Driven, EventLog, Halt, ImportedTurn, InboxError, InboxHost,
-        LogEntry, LogPage, LoggedEvent, Missing, MovedQueued, Next, OneLog, PassEnd, Recording,
-        Replaced, ResumeError, SessionLog, Settled, Started, Submission, Submitted, TurnInbox,
-        TurnLog, TurnRecord, TurnRetry, TurnState, Unresumable, Verdict, Wake, base_checkpoint,
-        settle_pending, submission_digest,
+        AfterPass, Attach, Base, Delivery, Driven, EventLog, FinishedPass, Halt, ImportedTurn,
+        InboxError, InboxHost, LogEntry, LogPage, LoggedEvent, Missing, MovedQueued, Next,
+        OneLog, PassContext, PassEnd, PassOrigin, PassOutcome, PassPhase, PassPolicy, PassRecord,
+        PassSpec, PolicyError, PolicyTurn, Recording, Replaced, ResumeError, SessionLog, Settled,
+        Started, Submission, Submitted, TurnInbox, TurnLog, TurnRecord, TurnRetry, TurnState,
+        Unresumable, Verdict, Wake, base_checkpoint, settle_pending, submission_digest,
     };
 }
 

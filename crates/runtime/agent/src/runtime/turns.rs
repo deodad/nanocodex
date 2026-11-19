@@ -146,6 +146,17 @@ impl AgentRuntime {
         }
     }
 
+    pub(crate) async fn consumed_steers(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Vec<String>, NanocodeError> {
+        self.durable_store()?
+            .kept_steers(session_id, request_id)
+            .await
+            .map_err(catalog_error)
+    }
+
     pub async fn settle(&self, session_id: &str) -> Result<bool, NanocodeError> {
         let Some(control) = self.delegates() else {
             return Ok(self.pending_turns(session_id).await?.is_empty());

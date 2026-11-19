@@ -29,6 +29,15 @@ use crate::{
     turn_log::{EventLog, Recording, TurnLog},
 };
 
+mod policy;
+
+type Admitted<'r, 'h> = &'r (dyn Fn() -> HostFuture<'h, ()> + Send + Sync + 'h);
+
+pub use policy::{
+    AfterPass, FinishedPass, PassContext, PassOrigin, PassOutcome, PassPhase, PassPolicy,
+    PassRecord, PassSpec, PolicyError, PolicyTurn,
+};
+
 pub trait InboxHost: Send + Sync + 'static {
     fn publish(&self, events: Vec<LoggedEvent>) -> HostFuture<'_, Result<(), String>>;
 
@@ -251,6 +260,7 @@ pub enum MovedQueued {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Run {
     Inbox,
+    Live,
     Resumed,
 }
 
@@ -264,10 +274,18 @@ struct Request {
 struct Requests {
     requests: HashMap<String, Request>,
     turns: HashMap<String, String>,
+    passes: HashMap<String, String>,
     usage: HashMap<String, nanocode_agent_core::TurnUsage>,
 }
 
 impl Requests {
+    fn owner(&self, id: &str) -> String {
+        self.passes
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_owned())
+    }
+
     fn cancelled(&self, id: &str) -> bool {
         self.requests
             .get(id)
@@ -651,7 +669,7 @@ impl<L: ?Sized> Shared<L> {
                     self.state.read(|state| {
                         state
                             .requests
-                            .get(id)
+                            .get(&state.owner(id))
                             .is_some_and(|request| request.running == Some(Run::Inbox))
                     })
                 })
@@ -670,7 +688,10 @@ impl<L: ?Sized> Shared<L> {
             SessionEvent::Subagent(_) => return None,
         };
         let ids: Identifiers = serde_json::from_str(event.payload.get()).unwrap_or_default();
-        match (ids.turn_id, ids.request_id) {
+        let accepted = ids
+            .request_id
+            .map(|id| self.state.read(|state| state.owner(&id)));
+        match (ids.turn_id, accepted) {
             (Some(turn), _) if !agent => Some(turn),
             (Some(turn), Some(accepted))
                 if self.state.read(|state| {
@@ -685,11 +706,13 @@ impl<L: ?Sized> Shared<L> {
                 });
                 Some(accepted)
             }
-            (Some(turn), _) => Some(
-                self.state
-                    .read(|state| state.turns.get(&turn).cloned())
-                    .unwrap_or(turn),
-            ),
+            (Some(turn), _) => Some(self.state.read(|state| {
+                state
+                    .turns
+                    .get(&turn)
+                    .cloned()
+                    .unwrap_or_else(|| state.owner(&turn))
+            })),
             (None, accepted) => accepted,
         }
     }
@@ -885,6 +908,12 @@ fn ignore_inactive(result: Result<(), NanocodeError>) -> Result<(), NanocodeErro
     }
 }
 
+fn refused(request_id: &str) -> InboxError {
+    InboxError::Agent(NanocodeError::InvalidRequest(format!(
+        "request {request_id} was created with an after-pass policy; drive it with drive_with_policy"
+    )))
+}
+
 fn fields(value: Value) -> Map<String, Value> {
     match value {
         Value::Object(fields) => fields,
@@ -1019,7 +1048,7 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
             read.into_iter().map(|id| (id, Delivered::Read)).collect(),
         ));
         loop {
-            let end = self.pass(request_id, request).await;
+            let end = self.pass(request_id, request, None).await;
             let delivery = self.shared.delivery.get();
             match self.shared.host.next(request_id, end, &delivery).await {
                 Next::Pass {
@@ -1038,12 +1067,20 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
         }
     }
 
-    async fn pass(&self, request_id: &str, request: PromptRequest) -> PassEnd {
+    async fn pass(
+        &self,
+        request_id: &str,
+        request: PromptRequest,
+        admitted: Option<Admitted<'_, '_>>,
+    ) -> PassEnd {
         self.shared.recording.store(true, Ordering::Release);
         let turn = match self.agent.prompt(request).await {
             Ok(turn) => turn,
             Err(error) => return PassEnd::Refused(error),
         };
+        if let Some(admitted) = admitted {
+            admitted().await;
+        }
         let control = turn.control();
         if let Some(note) = self
             .shared
@@ -1175,6 +1212,19 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
     }
 
     pub async fn drive(&self, next: Option<&str>) -> Result<Driven, InboxError> {
+        self.drive_with(next, None)
+            .await
+            .map_err(|error| match error {
+                PolicyError::Inbox(error) => error,
+                PolicyError::Host(error) => InboxError::Events(error),
+            })
+    }
+
+    async fn drive_with(
+        &self,
+        next: Option<&str>,
+        policy: Option<&dyn PassPolicy>,
+    ) -> Result<Driven, PolicyError> {
         if self.busy.swap(true, Ordering::AcqRel) {
             return Ok(Driven::Busy);
         }
@@ -1183,17 +1233,54 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
         if let Some(delegates) = self.runtime.delegates() {
             delegates.await_restored(&self.agent, root).await;
         }
-        if let Some(first) = self.runtime.pending_turns(root).await?.into_iter().next() {
-            return match self.shared.log.turn(&first).await? {
-                Some(record) if !record.state.is_terminal() => self.run(&first, true).await,
-                record => {
-                    let abandoned = record
-                        .as_ref()
-                        .is_some_and(|record| record.state != TurnState::Completed);
-                    self.resume(first, record.and_then(|record| record.hand), abandoned)
-                        .await
-                }
-            };
+        let pending = self
+            .runtime
+            .pending_turns(root)
+            .await
+            .map_err(InboxError::from)?;
+        if let Some(first) = pending.into_iter().next() {
+            if let Some(owner) = self
+                .shared
+                .log
+                .pass_owner(&first)
+                .await
+                .map_err(InboxError::from)?
+            {
+                return match policy {
+                    Some(policy) => self.recover_pass(&owner, &first, policy).await,
+                    None => Err(refused(&owner).into()),
+                };
+            }
+            return Ok(
+                match self
+                    .shared
+                    .log
+                    .turn(&first)
+                    .await
+                    .map_err(InboxError::from)?
+                {
+                    Some(record) if !record.state.is_terminal() => self.run(&first, true).await?,
+                    record => {
+                        let abandoned = record
+                            .as_ref()
+                            .is_some_and(|record| record.state != TurnState::Completed);
+                        self.resume(first, record.and_then(|record| record.hand), abandoned)
+                            .await?
+                    }
+                },
+            );
+        }
+        if let Some(policy) = policy
+            && let Some(open) = self
+                .shared
+                .log
+                .open_passes()
+                .await
+                .map_err(InboxError::from)?
+                .into_iter()
+                .next()
+        {
+            return self.drive_live(&open, policy).await;
         }
         let next = match next {
             Some(next) => Some(next.to_owned()),
@@ -1201,14 +1288,26 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
                 .shared
                 .log
                 .pending()
-                .await?
+                .await
+                .map_err(InboxError::from)?
                 .into_iter()
                 .next()
                 .map(|record| record.request_id),
         };
-        match next {
-            Some(next) => self.run(&next, false).await,
-            None => Ok(Driven::Idle),
+        let Some(next) = next else {
+            return Ok(Driven::Idle);
+        };
+        let marked = self
+            .shared
+            .log
+            .pass_record(&next)
+            .await
+            .map_err(InboxError::from)?
+            .is_some();
+        match (policy, marked) {
+            (Some(policy), _) => self.run_policy(&next, policy).await,
+            (None, true) => Err(refused(&next).into()),
+            (None, false) => Ok(self.run(&next, false).await?),
         }
     }
 
@@ -1232,11 +1331,9 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
                     .or_default()
                     .cancelled = true;
             });
-            let live = self
-                .agent
-                .turn_controls()
-                .into_iter()
-                .find(|(id, _)| id == request_id);
+            let live = self.agent.turn_controls().into_iter().find(|(id, _)| {
+                id == request_id || self.shared.state.read(|state| state.owner(id)) == request_id
+            });
             if let Some((_, control)) = live {
                 ignore_inactive(control.cancel().await)?;
             }
@@ -1421,6 +1518,18 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
     }
 
     async fn execute(&self, id: &str, prompt: Prompt, cancel: bool, run: Run) -> DurableOutcome {
+        self.execute_as(id, id, prompt, cancel, run, None).await
+    }
+
+    async fn execute_as(
+        &self,
+        id: &str,
+        pass_id: &str,
+        prompt: Prompt,
+        cancel: bool,
+        run: Run,
+        admitted: Option<Admitted<'_, '_>>,
+    ) -> DurableOutcome {
         let claimed = self.shared.state.update(|state| {
             let request = state.requests.entry(id.to_owned()).or_default();
             if request.running.is_some() {
@@ -1434,7 +1543,7 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             return DurableOutcome::Waiting;
         }
         let _claim = Claim(&self.shared, id);
-        let outcome = self.prompt(id, prompt, cancel).await;
+        let outcome = self.prompt(id, pass_id, prompt, cancel, admitted).await;
         if self.events.drained().await.is_err() {
             return DurableOutcome::Interrupted;
         }
@@ -1442,22 +1551,27 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             state.turns.retain(|_, request| request != id);
         });
         self.runtime
-            .durable_outcome(self.session_id(), id, outcome)
+            .durable_outcome(self.session_id(), pass_id, outcome)
             .await
     }
 
     async fn prompt(
         &self,
         id: &str,
+        pass_id: &str,
         prompt: Prompt,
         cancel: bool,
+        admitted: Option<Admitted<'_, '_>>,
     ) -> Result<String, NanocodeError> {
         let cancelled = || self.shared.state.read(|state| state.cancelled(id));
-        let mut request = PromptRequest::new(prompt).request_id(id);
+        let mut request = PromptRequest::new(prompt).request_id(pass_id);
         if cancel || cancelled() {
             request = request.cancel_on_admission();
         }
         let turn = self.agent.prompt(request).await?;
+        if let Some(admitted) = admitted {
+            admitted().await;
+        }
         if cancelled() {
             let control = turn.control();
             ignore_inactive(control.cancel().await)?;
