@@ -26,6 +26,7 @@ pub use function_tool::{Failure, FunctionHandler, FunctionTool, MaybeSend, Typed
 mod pins;
 mod policy;
 mod selection;
+pub mod sim;
 pub use nanocode_code_mode::CodeModeToolObservation;
 pub use pins::TextPins;
 pub use policy::{CodeModeToolPolicy, FileAccess, WorkspaceToolRouting};

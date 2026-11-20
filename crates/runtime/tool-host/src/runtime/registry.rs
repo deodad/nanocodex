@@ -379,6 +379,11 @@ impl ToolRegistry {
             };
             *paths.entry(path).or_default() |= writes;
         }
+        let written = paths
+            .iter()
+            .filter(|(_, writes)| **writes)
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         span.record(
             "tool.admission",
             match paths.values().max() {
@@ -414,6 +419,7 @@ impl ToolRegistry {
             Ok(execution) => execution,
             Err(payload) => panicked_tool_output(&span, payload),
         };
+        let execution = with_written(execution, written);
         let output_content = trace_content
             .then(|| serde_json::to_string(&execution.output).ok())
             .flatten();
@@ -852,6 +858,32 @@ fn nested_definition(definition: ToolDefinition) -> ToolDefinition {
         } => ToolDefinition::function("tool_search", description, parameters),
         other => other,
     }
+}
+
+fn with_written(mut execution: ToolOutput, written: Vec<String>) -> ToolOutput {
+    if written.is_empty()
+        || crate::sim::mutated(crate::sim::Mutation::ForgetsWritten)
+        || (!execution.success && !crate::sim::mutated(crate::sim::Mutation::WrittenOnFailure))
+    {
+        return execution;
+    }
+    let mut metadata = match execution
+        .metadata
+        .as_deref()
+        .map(|raw| serde_json::from_str::<Value>(raw.get()))
+    {
+        None => serde_json::Map::new(),
+        Some(Ok(Value::Object(fields))) => fields,
+        Some(_) => return execution,
+    };
+    if metadata.contains_key("written") {
+        return execution;
+    }
+    metadata.insert("written".into(), Value::from(written));
+    if let Ok(raw) = serde_json::value::to_raw_value(&metadata) {
+        execution.metadata = Some(raw);
+    }
+    execution
 }
 
 fn nested_input(

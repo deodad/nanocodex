@@ -25,6 +25,7 @@ mod executor;
 mod faults;
 mod gitremote;
 mod handauto;
+mod nestedmeta;
 mod handrouter;
 mod hands;
 mod host;
@@ -83,6 +84,7 @@ use crate::{
     dispatcher::{DispatcherMutation, DispatcherStats},
     gitremote::{GitRemoteMutation, GitRemoteStats},
     handauto::{HandAutoMutation, HandAutoStats},
+    nestedmeta::{NestedMetaMutation, NestedMetaStats},
     handrouter::{HandRouterMutation, HandRouterStats},
     hands::{HandsMutation, HandsStats},
     httpd::WireMutation,
@@ -158,6 +160,7 @@ enum Scenario {
     Partitions,
     Scale,
     HandAuto,
+    NestedMeta,
 }
 
 struct Args {
@@ -206,6 +209,7 @@ struct Args {
     partitions: PartitionsMutation,
     scale: ScaleConfig,
     hand_auto: HandAutoMutation,
+    nested_meta: NestedMetaMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
     #[cfg(unix)]
@@ -250,7 +254,8 @@ fn usage() -> ExitCode {
        workspace_crash: [--mutation {}]
        partitions: [--mutation {}]
        scale: [--load uniform|skewed] [--nodes 1,2,..,10] [--mutation {}]
-       hand_auto: [--mutation {}]",
+       hand_auto: [--mutation {}]
+       nested_meta: [--mutation {}]",
         Mutation::names(),
         TurnMutation::names(),
         onelog::PROTECTIONS.join("|"),
@@ -282,7 +287,8 @@ fn usage() -> ExitCode {
         WorkspaceCrashMutation::names(),
         PartitionsMutation::names(),
         ScaleMutation::names(),
-        HandAutoMutation::names()
+        HandAutoMutation::names(),
+        NestedMetaMutation::names()
     );
     ExitCode::from(2)
 }
@@ -360,6 +366,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut partitions = PartitionsMutation::None;
     let mut scale = ScaleConfig::default();
     let mut hand_auto = HandAutoMutation::None;
+    let mut nested_meta = NestedMetaMutation::None;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
     #[cfg(target_os = "linux")]
@@ -453,6 +460,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "partitions" => Scenario::Partitions,
                     "scale" => Scenario::Scale,
                     "hand_auto" => Scenario::HandAuto,
+                    "nested_meta" => Scenario::NestedMeta,
                     #[cfg(unix)]
                     "capture" => Scenario::Capture,
                     #[cfg(target_os = "linux")]
@@ -526,6 +534,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             workspace_crash = WorkspaceCrashMutation::parse(name)?
         }
         (Scenario::HandAuto, Some(name)) => hand_auto = HandAutoMutation::parse(name)?,
+        (Scenario::NestedMeta, Some(name)) => nested_meta = NestedMetaMutation::parse(name)?,
         #[cfg(unix)]
         (Scenario::Capture, Some(name)) => capture = capture::CaptureMutation::parse(name)?,
         #[cfg(not(unix))]
@@ -596,6 +605,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         partitions,
         scale,
         hand_auto,
+        nested_meta,
         #[cfg(unix)]
         alloc,
         #[cfg(unix)]
@@ -703,6 +713,9 @@ fn replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::HandAuto {
         return handauto::replay(seed, args.hand_auto);
+    }
+    if args.scenario == Scenario::NestedMeta {
+        return nestedmeta::replay(seed, args.nested_meta);
     }
     if args.scenario == Scenario::BoardSync {
         return board_sync::replay(seed, args.board_sync);
@@ -1079,6 +1092,7 @@ fn mutations() -> ExitCode {
     add("partitions", PartitionsMutation::names());
     add("scale", ScaleMutation::names());
     add("hand_auto", HandAutoMutation::names());
+    add("nested_meta", NestedMetaMutation::names());
     #[cfg(unix)]
     {
         add("alloc", alloc::AllocMutation::names());
@@ -1150,6 +1164,7 @@ struct Totals {
     partitions_totals: PartitionsStats,
     scale_totals: ScaleStats,
     hand_auto_totals: HandAutoStats,
+    nested_meta_totals: NestedMetaStats,
     #[cfg(unix)]
     capture_totals: capture::CaptureStats,
     #[cfg(target_os = "linux")]
@@ -1200,6 +1215,7 @@ impl Totals {
         self.partitions_totals.add(&other.partitions_totals);
         self.scale_totals.add(&other.scale_totals);
         self.hand_auto_totals.add(&other.hand_auto_totals);
+        self.nested_meta_totals.add(&other.nested_meta_totals);
         #[cfg(unix)]
         self.capture_totals.add(&other.capture_totals);
         #[cfg(target_os = "linux")]
@@ -1456,6 +1472,13 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
             args.options.verbose,
             &mut totals.hand_auto_totals,
         ),
+        Scenario::NestedMeta => nestedmeta::judge(
+            seed,
+            args.nested_meta,
+            args.twice,
+            args.options.verbose,
+            &mut totals.nested_meta_totals,
+        ),
         #[cfg(unix)]
         Scenario::Capture => capture::judge(
             seed,
@@ -1654,6 +1677,7 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::WorkspaceCrash
             && args.workspace_crash != WorkspaceCrashMutation::None)
         || (args.scenario == Scenario::HandAuto && args.hand_auto != HandAutoMutation::None)
+        || (args.scenario == Scenario::NestedMeta && args.nested_meta != NestedMetaMutation::None)
         || alloc_experiment(&args);
     let (mut passed, mut failed) = (0_u64, 0_u64);
     let mut all = Totals::default();
@@ -1732,6 +1756,7 @@ fn main() -> ExitCode {
         partitions_totals,
         scale_totals,
         hand_auto_totals,
+        nested_meta_totals,
         #[cfg(unix)]
         capture_totals,
         #[cfg(target_os = "linux")]
@@ -2023,6 +2048,16 @@ fn main() -> ExitCode {
             args.twice,
             args.hand_auto,
             &hand_auto_totals,
+        );
+    }
+    if args.scenario == Scenario::NestedMeta {
+        return nestedmeta::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.nested_meta,
+            &nested_meta_totals,
         );
     }
     if args.scenario == Scenario::Executor {
