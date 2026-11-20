@@ -144,6 +144,18 @@ pub type ToolError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub type ToolResult = std::result::Result<ToolOutput, ToolError>;
 
+pub enum Recovered<T = ToolOutput> {
+    Output(T),
+    NotDispatched,
+    Unknown,
+}
+
+impl<T> From<Option<T>> for Recovered<T> {
+    fn from(output: Option<T>) -> Self {
+        output.map_or(Self::Unknown, Self::Output)
+    }
+}
+
 impl ToolOutput {
     #[must_use]
     pub fn text(output: impl Into<String>) -> Self {

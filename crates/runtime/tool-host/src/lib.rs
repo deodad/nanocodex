@@ -19,7 +19,7 @@ pub trait ToolRecovery: Send + Sync + 'static {
         &'a self,
         name: &'a str,
         context: nanocode_tools::ToolContext<'a>,
-    ) -> embedded::HostFuture<'a, Option<nanocode_tools::ToolOutput>>;
+    ) -> embedded::HostFuture<'a, nanocode_tools::Recovered>;
 }
 
 pub use function_tool::{Failure, FunctionHandler, FunctionTool, MaybeSend, TypedHandler};

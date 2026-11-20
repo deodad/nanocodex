@@ -10,7 +10,9 @@
 pub use nanocode_home::SessionEnvironment;
 #[cfg(not(target_family = "wasm"))]
 use nanocode_tool_provider::DynamicToolProvider;
-use nanocode_tools::{Tool, ToolContext, ToolInput, ToolOutput, ToolOutputContent, ToolResult};
+use nanocode_tools::{
+    Recovered, Tool, ToolContext, ToolInput, ToolOutput, ToolOutputContent, ToolResult,
+};
 
 mod catalog;
 mod client;
@@ -504,11 +506,7 @@ impl Tool for PreparedMcpTool {
         &'life0 self,
         input: ToolInput,
         context: ToolContext<'life1>,
-    ) -> Option<
-        std::pin::Pin<
-            Box<dyn std::future::Future<Output = Option<ToolOutput>> + Send + 'async_trait>,
-        >,
-    >
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = Recovered> + Send + 'async_trait>>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -528,9 +526,7 @@ impl Tool for PreparedMcpTool {
         &'life0 self,
         input: ToolInput,
         context: ToolContext<'life1>,
-    ) -> Option<
-        std::pin::Pin<Box<dyn std::future::Future<Output = Option<ToolOutput>> + 'async_trait>>,
-    >
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = Recovered> + 'async_trait>>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -1023,7 +1019,7 @@ impl DynamicToolProvider for Mcp {
         name: &'life1 str,
         input: Value,
         context: ToolContext<'life2>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Option<ToolOutput>> + Send + 'async_trait>>
+    ) -> std::pin::Pin<Box<dyn Future<Output = Recovered> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -1031,17 +1027,14 @@ impl DynamicToolProvider for Mcp {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let output: Option<ToolOutput> = {
-                let entry = self.state.ready_entry(name).await?;
-                if !entry.tool_exposure.is_callable()
-                    || !entry.resumable
-                    || context.turn_id().is_none()
-                {
-                    return None;
-                }
-                resume_mcp_entry(&entry, input, entry.timeout, context).await
+            let Some(entry) = self.state.ready_entry(name).await else {
+                return Recovered::Unknown;
             };
-            output
+            if !entry.tool_exposure.is_callable() || !entry.resumable || context.turn_id().is_none()
+            {
+                return Recovered::Unknown;
+            }
+            resume_mcp_entry(&entry, input, entry.timeout, context).await
         })
     }
 }
@@ -1063,14 +1056,16 @@ async fn resume_mcp_entry(
     input: Value,
     timeout: Duration,
     context: ToolContext<'_>,
-) -> Option<ToolOutput> {
-    let result = call_mcp_entry(entry, input.clone(), timeout, context, true)
-        .await
-        .ok()?;
+) -> Recovered {
+    let Ok(result) = call_mcp_entry(entry, input.clone(), timeout, context, true).await else {
+        return Recovered::Unknown;
+    };
     match result.resumption() {
-        Resumption::Answered => Some(result_output(entry, result)),
-        Resumption::NotSeen => Some(execute_mcp_entry(entry, input, timeout, context).await),
-        Resumption::Unknown => None,
+        Resumption::Answered => Recovered::Output(result_output(entry, result)),
+        Resumption::NotSeen => {
+            Recovered::Output(execute_mcp_entry(entry, input, timeout, context).await)
+        }
+        Resumption::Unknown => Recovered::Unknown,
     }
 }
 

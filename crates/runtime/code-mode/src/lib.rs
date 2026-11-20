@@ -22,7 +22,7 @@ pub use toolset::{CodeModeToolObservation, CodeModeToolset};
 
 pub mod contract {
     pub use nanocode_tool_contracts::{
-        DEFAULT_TOOL_OUTPUT_TOKENS, HistorySource, SharedHistory, Tool, ToolContext,
+        DEFAULT_TOOL_OUTPUT_TOKENS, HistorySource, Recovered, SharedHistory, Tool, ToolContext,
         ToolDefinition, ToolError, ToolInput, ToolInputError, ToolOutput, ToolOutputBody,
         ToolOutputContent, ToolOutputWire, ToolProcessTraceWire, ToolResult,
     };

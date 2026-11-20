@@ -4,6 +4,7 @@ mod local;
 mod output;
 mod replay;
 use crate::code_mode_spec as spec;
+use crate::contract::Recovered;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -3505,12 +3506,14 @@ async fn execute_nested_call(
         Nested::Recover => {
             let recovered = match tools.recover_nested(&name, Value::clone(&input), context) {
                 Some(recovered) => recovered.await,
-                None => None,
+                None => Recovered::Unknown,
             };
-            recovered.unwrap_or_else(|| {
-                ToolOutput::error(replay::UNKNOWN_OUTCOME)
-                    .with_structured_result(replay::unknown_outcome())
-            })
+            match recovered {
+                Recovered::Output(output) => output,
+                Recovered::NotDispatched => run_nested(tools, &name, host, &input, context).await,
+                Recovered::Unknown => ToolOutput::error(replay::UNKNOWN_OUTCOME)
+                    .with_structured_result(replay::unknown_outcome()),
+            }
         }
         Nested::Refuse(cap) => {
             let text = format!(
@@ -3520,10 +3523,7 @@ async fn execute_nested_call(
                 "isError": true, "code": CALL_LIMIT, "retryable": false, "error": text,
             }))
         }
-        Nested::Run if host => {
-            caught(tools.execute_host_nested(&name, Value::clone(&input), context)).await
-        }
-        Nested::Run => caught(tools.execute_nested(&name, Value::clone(&input), context)).await,
+        Nested::Run => run_nested(tools, &name, host, &input, context).await,
     };
     let duration_ns =
         u64::try_from(nanocode_platform::elapsed(started_at).as_nanos()).unwrap_or(u64::MAX);
@@ -3551,6 +3551,20 @@ async fn execute_nested_call(
             duration_ns,
             metadata: execution.metadata,
         },
+    }
+}
+
+async fn run_nested(
+    tools: &dyn CodeModeToolset,
+    name: &str,
+    host: bool,
+    input: &Value,
+    context: ToolContext<'_>,
+) -> ToolOutput {
+    if host {
+        caught(tools.execute_host_nested(name, Value::clone(input), context)).await
+    } else {
+        caught(tools.execute_nested(name, Value::clone(input), context)).await
     }
 }
 

@@ -2,7 +2,7 @@
 #[cfg(not(target_family = "wasm"))]
 pub use nanocode_home::SessionEnvironment;
 #[cfg(not(target_family = "wasm"))]
-use nanocode_tool_contracts::{Tool, ToolContext, ToolDefinition, ToolOutput};
+use nanocode_tool_contracts::{Recovered, Tool, ToolContext, ToolDefinition, ToolOutput};
 #[cfg(not(target_family = "wasm"))]
 use serde_json::Value;
 #[cfg(not(target_family = "wasm"))]
@@ -113,7 +113,7 @@ pub trait DynamicToolProvider: Send + Sync {
         _name: &'life1 str,
         _input: Value,
         _context: ToolContext<'life2>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Option<ToolOutput>> + Send + 'async_trait>>
+    ) -> std::pin::Pin<Box<dyn Future<Output = Recovered> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -121,7 +121,7 @@ pub trait DynamicToolProvider: Send + Sync {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let output: Option<ToolOutput> = { None };
+            let output: Recovered = { Recovered::Unknown };
             output
         })
     }

@@ -18,6 +18,11 @@ pub use nanocode_tool_provider::DynamicToolProvider;
 pub use nanocode_tool_provider::ToolExposure;
 
 #[cfg(not(target_family = "wasm"))]
+use nanocode_tools::Recovered;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(not(target_family = "wasm"))]
 type Nested<'a> = crate::embedded::HostFuture<'a, Option<crate::ToolOutput>>;
 
 #[cfg(not(target_family = "wasm"))]
@@ -111,7 +116,7 @@ impl DynamicToolProvider for Gated {
         name: &'life1 str,
         input: serde_json::Value,
         context: crate::ToolContext<'life2>,
-    ) -> Nested<'async_trait>
+    ) -> crate::embedded::HostFuture<'async_trait, Recovered>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -120,7 +125,22 @@ impl DynamicToolProvider for Gated {
     {
         Box::pin(async move {
             let call_id = context.call_id().to_owned();
-            (self.gate)(name, &call_id, self.inner.recover(name, input, context)).await
+            let unsent = AtomicBool::new(false);
+            let recovered = Box::pin(async {
+                match self.inner.recover(name, input, context).await {
+                    Recovered::Output(output) => Some(output),
+                    Recovered::NotDispatched => {
+                        unsent.store(true, Ordering::Relaxed);
+                        None
+                    }
+                    Recovered::Unknown => None,
+                }
+            });
+            match (self.gate)(name, &call_id, recovered).await {
+                Some(output) => Recovered::Output(output),
+                None if unsent.load(Ordering::Relaxed) => Recovered::NotDispatched,
+                None => Recovered::Unknown,
+            }
         })
     }
 }

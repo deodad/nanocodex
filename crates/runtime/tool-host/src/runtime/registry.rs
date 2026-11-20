@@ -467,7 +467,7 @@ impl ToolRegistry {
         name: &'a str,
         input: Value,
         context: ToolContext<'a>,
-    ) -> Option<crate::embedded::HostFuture<'a, Option<ToolOutput>>> {
+    ) -> Option<crate::embedded::HostFuture<'a, Recovered>> {
         let input = match &self.hand_calls {
             Some(calls) => match take_hand(self.declares_hand(name), calls.auto(name), input) {
                 Ok((_, Some(hand))) if !calls.here(&hand) => {
@@ -489,13 +489,14 @@ impl ToolRegistry {
         }
         Some(Box::pin(async move {
             if !self.resolve(name).await {
-                return None;
+                return Recovered::Unknown;
             }
-            let provider = self.provider_of(name)?;
-            if !provider.resumes(name) {
-                return None;
+            match self.provider_of(name) {
+                Some(provider) if provider.resumes(name) => {
+                    provider.recover(name, input, context).await
+                }
+                _ => Recovered::Unknown,
             }
-            provider.recover(name, input, context).await
         }))
     }
 
@@ -954,7 +955,7 @@ impl nanocode_code_mode::CodeModeToolset for ToolRegistry {
         name: &'a str,
         input: Value,
         context: ToolContext<'a>,
-    ) -> Option<crate::embedded::HostFuture<'a, Option<ToolOutput>>> {
+    ) -> Option<crate::embedded::HostFuture<'a, Recovered>> {
         Self::recover_nested(self, name, input, context)
     }
 

@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use nanocode_tool_provider::{DynamicToolProvider, ToolExposure};
-use nanocode_tools::{Tool, ToolContext, ToolDefinition, ToolOutput};
+use nanocode_tools::{Recovered, Tool, ToolContext, ToolDefinition, ToolOutput};
 use serde_json::Value;
 
 pub use nanocode_mcp_tools::*;
@@ -125,7 +125,7 @@ impl DynamicToolProvider for Mcp {
         name: &'life1 str,
         input: Value,
         context: ToolContext<'life2>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Option<ToolOutput>> + Send + 'async_trait>>
+    ) -> std::pin::Pin<Box<dyn Future<Output = Recovered> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -133,7 +133,7 @@ impl DynamicToolProvider for Mcp {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let output: Option<ToolOutput> = { self.0.recover(name, input, context).await };
+            let output: Recovered = { self.0.recover(name, input, context).await };
             output
         })
     }

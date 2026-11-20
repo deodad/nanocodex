@@ -1,4 +1,6 @@
-use nanocode_tool_contracts::{ToolContext, ToolOutput, ToolOutputContent, ToolProcessTraceWire};
+use nanocode_tool_contracts::{
+    Recovered, ToolContext, ToolOutput, ToolOutputContent, ToolProcessTraceWire,
+};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -38,7 +40,7 @@ pub trait CodeModeToolset: Send + Sync {
         _name: &'a str,
         _input: Value,
         _context: ToolContext<'a>,
-    ) -> Option<HostFuture<'a, Option<ToolOutput>>> {
+    ) -> Option<HostFuture<'a, Recovered>> {
         None
     }
 

@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::HashSet, path::PathBuf, sync::Arc, time::Dur
 
 use nanocode_sync::Swap;
 
-use nanocode_tools::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};
+use nanocode_tools::{Recovered, Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};
 use nanocode_types::responses::CustomToolFormat;
 
 use super::{
@@ -661,11 +661,11 @@ impl EmbeddedToolRuntime {
             .collect()
     }
 
-    pub async fn recover_tool(&self, name: &str, context: ToolContext<'_>) -> Option<ToolOutput> {
-        self.recovery
-            .as_ref()?
-            .recover(name, self.stamp(context))
-            .await
+    pub async fn recover_tool(&self, name: &str, context: ToolContext<'_>) -> Recovered {
+        match &self.recovery {
+            Some(recovery) => recovery.recover(name, self.stamp(context)).await,
+            None => Recovered::Unknown,
+        }
     }
 
     pub async fn recover_code(

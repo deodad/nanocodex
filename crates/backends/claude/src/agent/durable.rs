@@ -929,7 +929,7 @@ impl State {
         };
         let undispatched = matches!(recovered, Recovered::NotDispatched);
         let recovered = match recovered {
-            Recovered::Reply(block) => Some(block),
+            Recovered::Output(block) => Some(block),
             Recovered::NotDispatched | Recovered::Unknown => None,
         };
         let interrupted = interrupted && recovered.is_none() && !undispatched;

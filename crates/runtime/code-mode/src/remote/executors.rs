@@ -253,16 +253,19 @@ impl HandCalls for ExecutorCalls {
         &'a self,
         hand: &'a str,
         context: ToolContext<'a>,
-    ) -> HostFuture<'a, Option<ToolOutput>> {
+    ) -> HostFuture<'a, crate::contract::Recovered> {
         Box::pin(async move {
-            let state = self.state.upgrade()?;
-            let host = state.read(|state| state.executors.get(hand).cloned())?;
+            let host = self
+                .state
+                .upgrade()
+                .and_then(|state| state.read(|state| state.executors.get(hand).cloned()));
+            let Some(host) = host else {
+                return crate::contract::Recovered::Unknown;
+            };
             match host.recover_call(context).await {
-                Ok(output) => output,
-                Err(error) if error.is_unsent() => {
-                    Some(ToolOutput::error(format!("hand `{hand}`: {error}")))
-                }
-                Err(_) => None,
+                Ok(output) => output.into(),
+                Err(error) if error.is_unsent() => crate::contract::Recovered::NotDispatched,
+                Err(_) => crate::contract::Recovered::Unknown,
             }
         })
     }

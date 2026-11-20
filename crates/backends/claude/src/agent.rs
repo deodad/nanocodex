@@ -19,6 +19,7 @@ use nanocode_agent_core::{
     input::Prompt,
 };
 use nanocode_sync::{FutureExt as _, StreamExt};
+use nanocode_tool_host::contract::Recovered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 mod assemble;
@@ -254,16 +255,11 @@ type RoundNotices = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 type CodeQuiet = Arc<dyn Fn() -> bool + Send + Sync>;
 type CodeTurnCleanup = Arc<dyn Fn(ClaudeToolProgress) -> BackendFuture<()> + Send + Sync>;
 type NestedToolLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-type ToolRecovery = Arc<dyn Fn(&str, ClaudeToolInvocation) -> ToolResultFuture + Send + Sync>;
-
-pub(crate) const NOT_DISPATCHED: &str =
-    "the hand never received this operation; it was not dispatched";
-
-pub(crate) enum Recovered {
-    NotDispatched,
-    Reply(ContentBlock),
-    Unknown,
-}
+type ToolRecovery = Arc<
+    dyn Fn(&str, ClaudeToolInvocation) -> AgentFuture<'static, Recovered<ClaudeToolReply>>
+        + Send
+        + Sync,
+>;
 pub(crate) type Steer = Arc<dyn Fn(String) -> BackendFuture<bool> + Send + Sync>;
 type AgentBound = Arc<dyn Fn(&Agent, &Steer) + Send + Sync>;
 
@@ -6126,18 +6122,18 @@ impl State {
         handler: &Handler,
         events: &AgentEventPublisher,
         control: (&Cursor, &Cancellation),
-    ) -> Result<Recovered> {
+    ) -> Result<Recovered<ContentBlock>> {
         let (cursor, cancel) = control;
         let Some(recovery) = &self.recovery else {
             return Ok(Recovered::Unknown);
         };
         let invocation = self.invocation(id, events, cursor);
-        let reply = nanocode_sync::select! {
-            reply = recovery(name, invocation) => reply,
+        let recovered = nanocode_sync::select! {
+            recovered = recovery(name, invocation) => recovered,
             () = cancel.cancelled() => return Ok(Recovered::Unknown),
         };
-        match reply {
-            Ok(reply) => self
+        match recovered {
+            Recovered::Output(reply) => self
                 .call_tool(
                     id,
                     name,
@@ -6147,9 +6143,9 @@ impl State {
                     (cursor, cancel, Some(reply)),
                 )
                 .await
-                .map(Recovered::Reply),
-            Err(message) if message == NOT_DISPATCHED => Ok(Recovered::NotDispatched),
-            Err(_) => Ok(Recovered::Unknown),
+                .map(Recovered::Output),
+            Recovered::NotDispatched => Ok(Recovered::NotDispatched),
+            Recovered::Unknown => Ok(Recovered::Unknown),
         }
     }
 

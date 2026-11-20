@@ -10,7 +10,7 @@ use crate::{
 use nanocode_tool_host::{
     CodeModeToolObservation, CodeModeToolPolicy, WorkspaceToolRouting,
     attachment::{RemoteRoute, RemoteRunnerCatalog, WorkspaceRouter},
-    contract::ToolOutputContent,
+    contract::{Recovered, ToolOutputContent},
 };
 use serde_json::Value;
 use std::{
@@ -1058,7 +1058,7 @@ impl crate::DynamicToolProvider for RunnerProvider {
         name: &'life1 str,
         mut input: Value,
         context: ToolContext<'life2>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Option<crate::ToolOutput>> + Send + 'async_trait>>
+    ) -> std::pin::Pin<Box<dyn Future<Output = Recovered> + Send + 'async_trait>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -1066,28 +1066,29 @@ impl crate::DynamicToolProvider for RunnerProvider {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let output: Option<crate::ToolOutput> = {
-                let snapshot = self.snapshot();
-                let provider = self.local_provider(&snapshot, name)?;
-                let key = ["workdir", "cwd", "path", "file_path"]
-                    .into_iter()
-                    .find(|key| input.get(key).is_some());
-                if let Some(path) = key.and_then(|key| input.get(key)).and_then(Value::as_str) {
-                    let path = normalize(Path::new(path)).ok()?;
-                    if snapshot
-                        .effective
-                        .iter()
-                        .any(|route| path.starts_with(route.mount()))
-                    {
-                        return None;
-                    }
-                }
-                if let Some(object) = input.as_object_mut() {
-                    object.remove("workdir");
-                }
-                provider.recover(name, input, context).await
+            let snapshot = self.snapshot();
+            let Some(provider) = self.local_provider(&snapshot, name) else {
+                return Recovered::Unknown;
             };
-            output
+            let key = ["workdir", "cwd", "path", "file_path"]
+                .into_iter()
+                .find(|key| input.get(key).is_some());
+            if let Some(path) = key.and_then(|key| input.get(key)).and_then(Value::as_str) {
+                let Ok(path) = normalize(Path::new(path)) else {
+                    return Recovered::Unknown;
+                };
+                if snapshot
+                    .effective
+                    .iter()
+                    .any(|route| path.starts_with(route.mount()))
+                {
+                    return Recovered::Unknown;
+                }
+            }
+            if let Some(object) = input.as_object_mut() {
+                object.remove("workdir");
+            }
+            provider.recover(name, input, context).await
         })
     }
 }

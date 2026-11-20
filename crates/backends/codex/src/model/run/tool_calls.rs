@@ -1,7 +1,7 @@
 use super::*;
 use crate::client::responses::FunctionOutputContent;
 use nanocode_code_mode::code_mode::NestedToolCall;
-use nanocode_code_mode::contract::ToolOutputContent;
+use nanocode_code_mode::contract::{Recovered, ToolOutputContent};
 use nanocode_sync::{Slot, Swap, SwapOption};
 use nanocode_tool_host::deadline::{Cap, Deadline};
 use nanocode_types::preview;
@@ -399,6 +399,8 @@ fn logged_nested_result(call: &NestedToolCall) -> Option<LoggedResult> {
         original_bytes,
     })
 }
+
+const NOT_DISPATCHED: &str = "This call was not dispatched, so it did not run.";
 
 const fn tool_output_tokens(model: Model, custom: Option<usize>) -> usize {
     match (model, custom) {
@@ -1279,14 +1281,17 @@ impl ModelRun {
             .with_host_context(host_context)
             .with_turn_id(Some(turn_id));
             let mut execution = if recover {
-                let Some(recovered) = tools.recover_tool(&qualified_name, context).await else {
-                    return Ok(Self::interrupted_tool_call(
-                        call.kind,
-                        &call.call_id,
-                        &qualified_name,
-                    ));
-                };
-                recovered
+                match tools.recover_tool(&qualified_name, context).await {
+                    Recovered::Output(output) => output,
+                    Recovered::NotDispatched => ToolOutput::error(NOT_DISPATCHED),
+                    Recovered::Unknown => {
+                        return Ok(Self::interrupted_tool_call(
+                            call.kind,
+                            &call.call_id,
+                            &qualified_name,
+                        ));
+                    }
+                }
             } else if tools.is_code_only() {
                 ToolOutput::error(
                     "This tool requires Code Mode; no direct handler was invoked. Reconcile any prior recovered effect before calling it through tools inside exec.",

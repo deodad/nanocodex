@@ -110,8 +110,8 @@ pub trait HandCalls: Send + Sync + 'static {
         &'a self,
         _hand: &'a str,
         _context: ToolContext<'a>,
-    ) -> HostFuture<'a, Option<ToolOutput>> {
-        Box::pin(async { None })
+    ) -> HostFuture<'a, crate::contract::Recovered> {
+        Box::pin(async { crate::contract::Recovered::Unknown })
     }
 
     fn call_once<'a>(

@@ -1,18 +1,26 @@
 use std::{
     collections::HashMap,
     ops::Range,
+    pin::Pin,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
-use nanocode_code_mode::code_mode::CellJournals;
+use nanocode::tool_contract::{
+    Recovered, Tool, ToolCallFuture, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
+};
+use nanocode_code_mode::code_mode::{CellJournal, CellJournals};
 use nanocode_code_mode_engine::{CellTools, EmbeddedHost, Interrupt, RuntimeEvent};
+use nanocode_sync::Atom;
 use nanocode_tool_runtime::{SessionEnvironment, Tools, runtime::ToolRuntime};
 use serde_json::{Value, json};
 
 use crate::{
-    executor::Clock,
+    executor::{Clock, Ended, Executor, Task},
     rng::{FNV_OFFSET, Rng, fnv},
 };
 
@@ -20,16 +28,26 @@ const CALLS_MIN: u64 = 1_000;
 const CALLS_MAX: u64 = 30_000;
 const BATCH_MAX: u64 = 500;
 const PAD_MAX: u64 = 64;
+const MOVED_SESSION: &str = "cell-calls-moved";
+const MOVED_CALL: &str = "cell-calls-moved-exec";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellCallsMutation {
     None,
     CrossResults,
     RootRecoveryUnbound,
+    HostClaimsUnsent,
+    HostForgetsUnsent,
 }
 
 impl CellCallsMutation {
-    const ALL: [Self; 3] = [Self::None, Self::CrossResults, Self::RootRecoveryUnbound];
+    const ALL: [Self; 5] = [
+        Self::None,
+        Self::CrossResults,
+        Self::RootRecoveryUnbound,
+        Self::HostClaimsUnsent,
+        Self::HostForgetsUnsent,
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
@@ -42,6 +60,8 @@ impl CellCallsMutation {
             Self::None => "none",
             Self::CrossResults => "cross_results",
             Self::RootRecoveryUnbound => "root_recovery_unbound",
+            Self::HostClaimsUnsent => "host_claims_unsent",
+            Self::HostForgetsUnsent => "host_forgets_unsent",
         }
     }
 
@@ -187,23 +207,205 @@ fn root_recovery(seed: u64, mutation: CellCallsMutation) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reached {
+    Dispatched,
+    NotDispatched,
+}
+
+enum Side {
+    Before(CellJournals, Arc<Atom<Option<Vec<CellJournal>>>>),
+    After,
+}
+
+struct Moved {
+    side: Side,
+    reached: Reached,
+    runs: Arc<AtomicU64>,
+    mutation: CellCallsMutation,
+}
+
+impl Tool for Moved {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "m",
+            "Answer an index",
+            json!({
+                "type": "object",
+                "properties": { "i": { "type": "integer" } },
+                "required": ["i"]
+            }),
+        )
+    }
+
+    fn execute<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        input: ToolInput,
+        _context: ToolContext<'life1>,
+    ) -> ToolCallFuture<'async_trait, ToolResult>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let index = input.decode_json::<Value>()?["i"].clone();
+            if let Side::Before(journals, snapshot) = &self.side {
+                let cells = journals.live_journals(MOVED_SESSION);
+                snapshot.update(|slot| *slot = Some(cells.clone()));
+                if self.reached == Reached::NotDispatched {
+                    return Ok(ToolOutput::text("the cell moved first"));
+                }
+            }
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::text(format!("m:{index}")))
+        })
+    }
+
+    fn recover<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _input: ToolInput,
+        _context: ToolContext<'life1>,
+    ) -> Option<Pin<Box<dyn Future<Output = Recovered> + Send + 'async_trait>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        let unsent = match (self.reached, self.mutation) {
+            (Reached::Dispatched, CellCallsMutation::HostClaimsUnsent) => true,
+            (Reached::NotDispatched, CellCallsMutation::HostForgetsUnsent) => false,
+            (reached, _) => reached == Reached::NotDispatched,
+        };
+        Some(Box::pin(async move {
+            if unsent {
+                Recovered::NotDispatched
+            } else {
+                Recovered::Unknown
+            }
+        }))
+    }
+}
+
+fn settle<T>(seed: u64, clock: &Arc<Clock>, future: impl Future<Output = T>) -> Option<T> {
+    let slot = std::cell::RefCell::new(None);
+    let task: Task<'_> = Box::pin(async {
+        *slot.borrow_mut() = Some(future.await);
+    });
+    match Executor::new(
+        Arc::clone(clock),
+        Rng::derive(seed, "cell_calls_moved_scheduler"),
+    )
+    .run(vec![task], None)
+    {
+        Ended::Finished => slot.into_inner(),
+        Ended::Crashed | Ended::Stuck => None,
+    }
+}
+
+fn moved_runtime(tool: Moved, journals: &CellJournals) -> Result<ToolRuntime, String> {
+    let tools = Tools::builder()
+        .without_defaults()
+        .add(tool)
+        .cell_journals(journals.clone())
+        .build()
+        .map_err(|error| format!("tools: {error}"))?;
+    Ok(ToolRuntime::new_with_tools(
+        std::env::temp_dir(),
+        Vec::new(),
+        &tools,
+    ))
+}
+
+fn moved_call(
+    seed: u64,
+    clock: &Arc<Clock>,
+    reached: Reached,
+    index: u64,
+    mutation: CellCallsMutation,
+) -> Result<(), String> {
+    let code = format!("text(await tools.m({{ i: {index} }}));");
+    let context = ToolContext::new("sim", MOVED_SESSION, MOVED_CALL, &[], usize::MAX);
+    let runs = Arc::new(AtomicU64::new(0));
+    let snapshot = Arc::new(Atom::new(None));
+    let before = CellJournals::new();
+    let first = moved_runtime(
+        Moved {
+            side: Side::Before(before.clone(), Arc::clone(&snapshot)),
+            reached,
+            runs: Arc::clone(&runs),
+            mutation,
+        },
+        &before,
+    )?;
+    settle(seed, clock, first.execute_code(&code, context))
+        .ok_or("moved_call: the first cell never finished")?
+        .map_err(|error| format!("moved_call: the first cell failed: {error}"))?;
+    let cells = snapshot
+        .read(Option::clone)
+        .ok_or("moved_call: the call never saw its cell's journal")?;
+    let running = cells.iter().flat_map(CellJournal::unknown_calls).count();
+    if running != 1 {
+        return Err(format!(
+            "moved_call: the moved journal holds {running} running calls, not 1"
+        ));
+    }
+
+    let after = CellJournals::new();
+    after.restore(MOVED_SESSION, cells, None, HashMap::new());
+    let second = moved_runtime(
+        Moved {
+            side: Side::After,
+            reached,
+            runs: Arc::clone(&runs),
+            mutation,
+        },
+        &after,
+    )?;
+    let execution = settle(seed, clock, second.recover_code(context))
+        .ok_or("moved_call: the replayed cell never finished")?
+        .map_err(|error| format!("moved_call: the replayed cell failed: {error}"))?
+        .ok_or("moved_call: the moved cell was not recovered")?;
+    let output = serde_json::to_string(&execution.output).unwrap_or_default();
+    let ran = runs.load(Ordering::SeqCst);
+    if ran != 1 {
+        return Err(format!(
+            "nested_runs_once: a nested call {reached:?} before its cell moved ran {ran} times"
+        ));
+    }
+    let answer = format!("m:{index}");
+    if reached == Reached::NotDispatched && !output.contains(&answer) {
+        return Err(format!(
+            "nested_runs_once: the replayed cell never received {answer}: {output}"
+        ));
+    }
+    Ok(())
+}
+
 fn simulate(seed: u64, mutation: CellCallsMutation) -> CellCallsOutcome {
     let mut rng = Rng::derive(seed, "cell_calls");
     let calls = rng.range(CALLS_MIN, CALLS_MAX);
     let batch = rng.range(1, BATCH_MAX);
     let pad = "x".repeat(usize::try_from(rng.below(PAD_MAX)).expect("a pad fits in usize"));
-    let shape = format!("calls={calls} batch={batch} pad={}", pad.len());
+    let index = Rng::derive(seed, "cell_calls_moved").below(CALLS_MAX);
+    let shape = format!(
+        "calls={calls} batch={batch} pad={} moved={index}",
+        pad.len()
+    );
 
     let code = format!(
         "const n = {calls}, b = {batch}; let c = 0, s = 0; for (let i = 0; i < n; i += b) {{ const r = await Promise.all(Array.from({{ length: Math.min(b, n - i) }}, (_, j) => tools.t({{ i: i + j }}))); for (const v of r) {{ const o = typeof v === 'string' ? JSON.parse(v) : v; c += 1; s += o.i; }} }} store('done', [c, s]);"
     );
     let tools = CellTools::encode(&[json!({ "kind": "function", "name": "t", "tool_name": "t" })])
         .expect("the cell tool encodes");
-    crate::host::enter(seed, &Clock::new());
+    let clock = Clock::new();
+    crate::host::enter(seed, &clock);
     let mut host = EmbeddedHost::spawn().expect("the embedded host starts");
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
 
     let wrong = root_recovery(seed, mutation)
+        .and_then(|()| moved_call(seed, &clock, Reached::Dispatched, index, mutation))
+        .and_then(|()| moved_call(seed, &clock, Reached::NotDispatched, index, mutation))
         .and_then(|()| {
             host.start_cell(
                 1,

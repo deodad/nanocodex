@@ -9,7 +9,7 @@ use crate::{
 use nanocode_agent_core::{AgentHandle, NanocodeError, Result};
 use nanocode_tool_host::{
     ToolContext, ToolDefinition as RuntimeDefinition, ToolInput, ToolOutput, Tools,
-    contract::{ToolOutputBody, ToolOutputContent},
+    contract::{Recovered, ToolOutputBody, ToolOutputContent},
     embedded::{
         CodeModeExecution, CodeModeObserver, CodeModeUpdate, NestedToolCall, OwnedToolContext,
     },
@@ -811,19 +811,24 @@ impl Call {
         runtime: &ToolRuntime,
         name: &str,
         invocation: &ClaudeToolInvocation,
-    ) -> std::result::Result<ClaudeToolReply, String> {
+    ) -> Recovered<ClaudeToolReply> {
         let context = tool_context(invocation);
         if matches!(name, "exec" | "wait") {
             return match runtime.recover_code(context).await {
-                Ok(Some(execution)) => Ok(code_reply(execution, &invocation.call_id)),
-                Ok(None) => Err("not recovered".into()),
-                Err(error) if error.is_unsent() => Err(crate::agent::NOT_DISPATCHED.into()),
-                Err(error) => Err(error.to_string()),
+                Ok(Some(execution)) => {
+                    Recovered::Output(code_reply(execution, &invocation.call_id))
+                }
+                Ok(None) => Recovered::Unknown,
+                Err(error) if error.is_unsent() => Recovered::NotDispatched,
+                Err(_) => Recovered::Unknown,
             };
         }
         match runtime.recover_tool(name, context).await {
-            Some(output) => tool_reply(output),
-            None => Err("not recovered".into()),
+            Recovered::Output(output) => {
+                tool_reply(output).map_or(Recovered::Unknown, Recovered::Output)
+            }
+            Recovered::NotDispatched => Recovered::NotDispatched,
+            Recovered::Unknown => Recovered::Unknown,
         }
     }
 }

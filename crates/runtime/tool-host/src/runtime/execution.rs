@@ -349,12 +349,13 @@ impl ToolRuntime {
         &'call self,
         name: &'call str,
         context: ToolContext<'call>,
-    ) -> nanocode_sync::future::BoxFuture<'call, Option<ToolOutput>> {
+    ) -> nanocode_sync::future::BoxFuture<'call, Recovered> {
         let context = self.stamp(context);
         Box::pin(async move {
-            match &self.inner {
-                Runtime::Native(_) => self.recovery.as_ref()?.recover(name, context).await,
-                Runtime::Host(runtime) => runtime.recover_tool(name, context).await,
+            match (&self.inner, &self.recovery) {
+                (Runtime::Native(_), Some(recovery)) => recovery.recover(name, context).await,
+                (Runtime::Native(_), None) => Recovered::Unknown,
+                (Runtime::Host(runtime), _) => runtime.recover_tool(name, context).await,
             }
         })
     }

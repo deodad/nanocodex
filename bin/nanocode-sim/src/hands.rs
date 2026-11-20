@@ -19,7 +19,7 @@ use nanocode_code_mode::remote::{
     RemoteCodeModeHost, RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation,
     RemoteReply, RemoteTransport, output_from_wire, output_to_wire,
 };
-use nanocode_code_mode::{ToolContext, ToolOutput, ToolOutputBody};
+use nanocode_code_mode::{ToolContext, ToolOutput, ToolOutputBody, contract::Recovered};
 use nanocode_durability_core::{
     OwnerId, Settle, StateCommit, StateStore, StoreError, StoreFuture, SummaryUpdate,
 };
@@ -1660,10 +1660,11 @@ impl World {
                 let context =
                     ToolContext::new("", SESSION, &call_id, &[], DEFAULT_TOOL_OUTPUT_TOKENS)
                         .with_turn_id(Some(TURN));
-                let outcome = calls
-                    .recover(self.named(index), context)
-                    .await
-                    .map_or(Outcome::Unknown, |output| Self::output(&output));
+                let outcome = match calls.recover(self.named(index), context).await {
+                    Recovered::Output(output) => Self::output(&output),
+                    Recovered::NotDispatched => Outcome::NotDispatched,
+                    Recovered::Unknown => Outcome::Unknown,
+                };
                 match outcome {
                     Outcome::NotDispatched
                         if self.store.mutation == HandsMutation::FleetSwallowUnsent =>

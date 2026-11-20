@@ -231,7 +231,7 @@ impl CodeModeToolset for LocalTools {
         name: &'a str,
         input: Value,
         context: ToolContext<'a>,
-    ) -> Option<HostFuture<'a, Option<ToolOutput>>> {
+    ) -> Option<HostFuture<'a, crate::contract::Recovered>> {
         let found = find(&self.tools, name);
         let Some((here, hands)) = &self.hands else {
             return recover(found, name, input, context);
@@ -261,7 +261,7 @@ fn recover<'a>(
     name: &'a str,
     input: Value,
     context: ToolContext<'a>,
-) -> Option<HostFuture<'a, Option<ToolOutput>>> {
+) -> Option<HostFuture<'a, crate::contract::Recovered>> {
     let (tool, definition) = found?;
     tool.recover(nested_tool_input(definition, name, input).ok()?, context)
 }

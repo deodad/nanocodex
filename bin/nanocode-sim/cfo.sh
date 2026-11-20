@@ -286,6 +286,8 @@ default_table='
 2 cell_calls_twice pass --scenario cell_calls --twice
 1 canary_cell_calls_cross_results canary:8 --scenario cell_calls --mutation cross_results
 1 canary_cell_calls_root_recovery_unbound canary:8 --scenario cell_calls --mutation root_recovery_unbound
+1 canary_cell_calls_host_claims_unsent canary:8 --scenario cell_calls --mutation host_claims_unsent
+1 canary_cell_calls_host_forgets_unsent canary:8 --scenario cell_calls --mutation host_forgets_unsent
 4 nested_meta pass --scenario nested_meta
 1 nested_meta_twice pass --scenario nested_meta --twice
 1 canary_nested_meta_forgets_written canary:8 --scenario nested_meta --mutation forgets_written

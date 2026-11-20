@@ -370,7 +370,7 @@ pub trait Tool: Send + Sync + 'static {
         &'life0 self,
         _input: ToolInput,
         _context: ToolContext<'life1>,
-    ) -> Option<Pin<Box<dyn Future<Output = Option<ToolOutput>> + Send + 'async_trait>>>
+    ) -> Option<Pin<Box<dyn Future<Output = Recovered> + Send + 'async_trait>>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -384,7 +384,7 @@ pub trait Tool: Send + Sync + 'static {
         &'life0 self,
         _input: ToolInput,
         _context: ToolContext<'life1>,
-    ) -> Option<Pin<Box<dyn Future<Output = Option<ToolOutput>> + 'async_trait>>>
+    ) -> Option<Pin<Box<dyn Future<Output = Recovered> + 'async_trait>>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, num::NonZeroU64, pin::pin, sync::Arc};
 use nanocode_code_mode::embedded::HandCalls;
 use nanocode_cost_fold::Placement;
 use nanocode_sync::{AtomMap, Notify};
-use nanocode_tool_contracts::{ToolContext, ToolOutput, ToolOutputWire};
+use nanocode_tool_contracts::{Recovered, ToolContext, ToolOutput, ToolOutputWire};
 use serde_json::{Value, json};
 
 use crate::{
@@ -452,12 +452,8 @@ impl HandCalls for Router {
         Box::pin(self.route(hand, name, input, context))
     }
 
-    fn recover<'a>(
-        &'a self,
-        hand: &'a str,
-        context: ToolContext<'a>,
-    ) -> HostFuture<'a, Option<ToolOutput>> {
-        Box::pin(Self::recover(self, hand, context))
+    fn recover<'a>(&'a self, hand: &'a str, context: ToolContext<'a>) -> HostFuture<'a, Recovered> {
+        Box::pin(async move { Self::recover(self, hand, context).await.into() })
     }
 }
 
