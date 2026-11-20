@@ -288,6 +288,8 @@ default_table='
 1 nested_meta_twice pass --scenario nested_meta --twice
 1 canary_nested_meta_forgets_written canary:8 --scenario nested_meta --mutation forgets_written
 1 canary_nested_meta_written_on_failure canary:8 --scenario nested_meta --mutation written_on_failure
+1 canary_nested_meta_catalog_keeps_escalation canary:8 --scenario nested_meta --mutation catalog_keeps_escalation
+1 canary_nested_meta_call_keeps_escalation canary:8 --scenario nested_meta --mutation call_keeps_escalation
 8 repo_cache pass --scenario repo_cache
 2 repo_cache_twice pass --scenario repo_cache --twice
 1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head

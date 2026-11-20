@@ -535,6 +535,14 @@ impl ToolRegistry {
         })
     }
 
+    pub(super) fn without_escalation(&mut self) {
+        for (tool, definition) in self.ordered.iter_mut().zip(&mut self.definitions) {
+            *tool = crate::escalation::Unescalated::wrap(Arc::clone(tool));
+            *definition = tool.definition();
+        }
+        self.catalog = OnceLock::new();
+    }
+
     pub(super) fn exclude_code_tools(&mut self, excluded: &HashSet<String>) {
         self.excluded_code_tools.clone_from(excluded);
         self.catalog = OnceLock::new();

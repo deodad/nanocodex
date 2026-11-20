@@ -226,6 +226,8 @@ pub struct Tools {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) nested_call_limit: Option<usize>,
     #[cfg(not(target_family = "wasm"))]
+    pub(crate) without_escalation: bool,
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) cell_guard: Option<nanocode_code_mode::code_mode::CellGuard>,
     pub(crate) cell_yield: Option<std::time::Duration>,
     pub(crate) exec_yield: Option<std::time::Duration>,
@@ -303,6 +305,8 @@ impl Default for Tools {
             cell_journals: None,
             #[cfg(not(target_family = "wasm"))]
             nested_call_limit: None,
+            #[cfg(not(target_family = "wasm"))]
+            without_escalation: false,
             #[cfg(not(target_family = "wasm"))]
             cell_guard: None,
             cell_yield: None,
@@ -971,6 +975,13 @@ impl ToolsBuilder {
     #[must_use]
     pub fn cell_journals(mut self, journals: nanocode_code_mode::code_mode::CellJournals) -> Self {
         self.tools.cell_journals = Some(journals);
+        self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub const fn without_escalation(mut self) -> Self {
+        self.tools.without_escalation = true;
         self
     }
 

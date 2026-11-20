@@ -657,6 +657,9 @@ impl NativeToolRuntime {
             tools.process_route_store.clone(),
             tools.runner_pool.as_ref(),
         );
+        if tools.without_escalation {
+            registry.without_escalation();
+        }
         if let Some(working_directory) = &tools.working_directory {
             self.working_directory = Arc::clone(working_directory);
         }

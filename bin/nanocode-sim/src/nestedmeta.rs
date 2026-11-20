@@ -1,9 +1,14 @@
-use std::{collections::BTreeSet, ops::Range, process::ExitCode, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    ops::Range,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+};
 
 use nanocode_code_mode::{ToolContext, ToolOutput};
 use nanocode_sync::block_on;
 use nanocode_tool_runtime::{
-    CodeModeToolPolicy, FileAccess, Tools,
+    CodeModeToolPolicy, ESCALATION_INPUTS, FileAccess, Tools,
     runtime::ToolRuntime,
     sim::{self as host_sim, Mutation as Rule},
 };
@@ -17,6 +22,7 @@ use crate::{
 const SESSION: &str = "nested-meta";
 const TOUCH: &str = "touch";
 const PLAIN: &str = "plain";
+const ESCALATE: &str = "escalate";
 const PATHS: [&str; 6] = ["a.txt", "src/b.rs", "c/d/e.md", "f", "g.json", "h i.txt"];
 const CALLS: Range<u64> = 20..400;
 
@@ -25,10 +31,18 @@ pub enum NestedMetaMutation {
     None,
     ForgetsWritten,
     WrittenOnFailure,
+    CatalogKeepsEscalation,
+    CallKeepsEscalation,
 }
 
 impl NestedMetaMutation {
-    const ALL: [Self; 3] = [Self::None, Self::ForgetsWritten, Self::WrittenOnFailure];
+    const ALL: [Self; 5] = [
+        Self::None,
+        Self::ForgetsWritten,
+        Self::WrittenOnFailure,
+        Self::CatalogKeepsEscalation,
+        Self::CallKeepsEscalation,
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
@@ -41,6 +55,8 @@ impl NestedMetaMutation {
             Self::None => "none",
             Self::ForgetsWritten => "forgets_written",
             Self::WrittenOnFailure => "written_on_failure",
+            Self::CatalogKeepsEscalation => "catalog_keeps_escalation",
+            Self::CallKeepsEscalation => "call_keeps_escalation",
         }
     }
 
@@ -57,6 +73,8 @@ impl NestedMetaMutation {
             Self::None => Rule::None,
             Self::ForgetsWritten => Rule::ForgetsWritten,
             Self::WrittenOnFailure => Rule::WrittenOnFailure,
+            Self::CatalogKeepsEscalation => Rule::CatalogKeepsEscalation,
+            Self::CallKeepsEscalation => Rule::CallKeepsEscalation,
         }
     }
 }
@@ -68,6 +86,8 @@ pub struct NestedMetaStats {
     pub wrote: u64,
     pub failed: u64,
     pub plain: u64,
+    pub unescalated: u64,
+    pub escalating: u64,
 }
 
 impl NestedMetaStats {
@@ -77,6 +97,8 @@ impl NestedMetaStats {
         self.wrote += other.wrote;
         self.failed += other.failed;
         self.plain += other.plain;
+        self.unescalated += other.unescalated;
+        self.escalating += other.escalating;
     }
 }
 
@@ -105,6 +127,57 @@ impl nanocode::FunctionHandler for Touch {
     }
 }
 
+struct Escalate(Arc<Mutex<Vec<String>>>);
+
+impl nanocode::FunctionHandler for Escalate {
+    fn call<'a>(
+        &'a self,
+        _name: &'a str,
+        input: Value,
+        _context: nanocode::tools::ToolContext<'a>,
+    ) -> nanocode::HostFuture<'a, Result<Value, String>> {
+        let keys = input
+            .as_object()
+            .map(|fields| fields.keys().cloned().collect())
+            .unwrap_or_default();
+        *self.0.lock().expect("the escalate log is not poisoned") = keys;
+        Box::pin(async move { Ok(json!({ "ok": true })) })
+    }
+}
+
+fn escalation_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "cmd": { "type": "string" },
+            "sandbox_permissions": { "type": "string" },
+            "justification": { "type": "string" },
+            "prefix_rule": { "type": "array" },
+            "dangerouslyDisableSandbox": { "type": "boolean" }
+        },
+        "required": ["cmd", "justification"]
+    })
+}
+
+fn declared(definition: &nanocode_code_mode::ToolDefinition) -> Option<(Vec<String>, Vec<String>)> {
+    let nanocode_code_mode::ToolDefinition::Function { parameters, .. } = definition else {
+        return None;
+    };
+    let schema = parameters.as_value();
+    let names = |key: &str| -> Vec<String> {
+        match schema.get(key) {
+            Some(Value::Object(fields)) => fields.keys().cloned().collect(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    Some((names("properties"), names("required")))
+}
+
 struct Declares;
 
 impl CodeModeToolPolicy for Declares {
@@ -129,9 +202,9 @@ impl CodeModeToolPolicy for Declares {
     }
 }
 
-fn tools() -> Tools {
+fn tools(unescalated: bool, seen: &Arc<Mutex<Vec<String>>>) -> Tools {
     let schema = json!({ "type": "object", "properties": { "files": { "type": "array" }, "fail": { "type": "boolean" } } });
-    Tools::builder()
+    let builder = Tools::builder()
         .without_defaults()
         .tool(nanocode::FunctionTool::new(
             TOUCH,
@@ -145,6 +218,18 @@ fn tools() -> Tools {
             schema,
             Arc::new(Touch),
         ))
+        .tool(nanocode::FunctionTool::new(
+            ESCALATE,
+            "Run with escalation",
+            escalation_schema(),
+            Arc::new(Escalate(Arc::clone(seen))),
+        ));
+    let builder = if unescalated {
+        builder.without_escalation()
+    } else {
+        builder
+    };
+    builder
         .build()
         .expect("the nested_meta tools build")
         .with_code_mode_policy(Arc::new(Declares))
@@ -164,7 +249,14 @@ fn run_seed(seed: u64, mutation: NestedMetaMutation) -> Outcome {
     let mut rng = Rng::derive(seed, "nested_meta");
     let calls = rng.range(CALLS.start, CALLS.end);
     let shape = format!("calls={calls}");
-    let runtime = ToolRuntime::new_with_tools(std::env::temp_dir(), Vec::new(), &tools());
+    let mut esc = Rng::derive(seed, "nested_meta escalation calls");
+    let unescalated = Rng::derive(seed, "nested_meta escalation").below(2) == 0;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let runtime = ToolRuntime::new_with_tools(
+        std::env::temp_dir(),
+        Vec::new(),
+        &tools(unescalated, &seen),
+    );
     let mut stats = NestedMetaStats {
         seeds: 1,
         calls,
@@ -172,7 +264,70 @@ fn run_seed(seed: u64, mutation: NestedMetaMutation) -> Outcome {
     };
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
     let mut wrong = None;
+    if unescalated {
+        stats.unescalated += 1;
+    }
+    let catalogs = [
+        ("model", runtime.model_specs(SESSION)),
+        ("code_mode", runtime.registered_code_mode_definitions()),
+    ];
+    for (surface, definitions) in &catalogs {
+        let Some((properties, required)) = definitions
+            .iter()
+            .find(|definition| definition.name() == ESCALATE)
+            .and_then(declared)
+        else {
+            continue;
+        };
+        let listed: Vec<&str> = ESCALATION_INPUTS
+            .iter()
+            .copied()
+            .filter(|field| properties.iter().any(|name| name == field) || required.iter().any(|name| name == field))
+            .collect();
+        let expected = if unescalated { 0 } else { ESCALATION_INPUTS.len() };
+        if listed.len() != expected || !properties.iter().any(|name| name == "cmd") {
+            wrong = Some(format!(
+                "catalog_escalation: {surface} catalog lists {listed:?} (unescalated={unescalated}) properties={properties:?}"
+            ));
+        }
+        digest = fnv(digest, format!("{surface}:{properties:?}:{required:?}").as_bytes());
+    }
     for index in 0..calls {
+        if wrong.is_some() {
+            break;
+        }
+        if esc.below(4) == 0 {
+            let mut input = serde_json::Map::new();
+            input.insert("cmd".into(), json!("true"));
+            let mut sent = Vec::new();
+            for field in ESCALATION_INPUTS {
+                if esc.below(2) == 0 {
+                    input.insert(field.into(), json!("x"));
+                    sent.push(field);
+                }
+            }
+            let step = format!("esc-{index}");
+            let context = ToolContext::new("", SESSION, &step, &[], usize::MAX);
+            let output = block_on(runtime.execute_nested_tool(ESCALATE, Value::Object(input), context));
+            let keys = std::mem::take(&mut *seen.lock().expect("the escalate log is not poisoned"));
+            digest = fnv(digest, format!("{step}:{}:{keys:?}", output.success).as_bytes());
+            if !sent.is_empty() {
+                stats.escalating += 1;
+            }
+            let arrived: Vec<&str> = ESCALATION_INPUTS
+                .iter()
+                .copied()
+                .filter(|field| keys.iter().any(|key| key == field))
+                .collect();
+            let want: Vec<&str> = if unescalated { Vec::new() } else { sent.clone() };
+            if !output.success || arrived != want || !keys.iter().any(|key| key == "cmd") {
+                wrong = Some(format!(
+                    "call_escalation: call {index} sent {sent:?} (unescalated={unescalated}), the tool saw {keys:?}, success={}",
+                    output.success
+                ));
+                break;
+            }
+        }
         let name = if rng.below(5) == 0 { PLAIN } else { TOUCH };
         let fail = rng.below(4) == 0;
         let count = rng.below(5);

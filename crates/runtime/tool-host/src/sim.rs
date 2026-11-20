@@ -7,6 +7,8 @@ pub enum Mutation {
     ForgetsWritten,
     WrittenOnFailure,
     AcceptorDropsSelection,
+    CatalogKeepsEscalation,
+    CallKeepsEscalation,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

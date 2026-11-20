@@ -26,9 +26,13 @@ pub use function_tool::{Failure, FunctionHandler, FunctionTool, MaybeSend, Typed
 mod pins;
 mod policy;
 mod selection;
+#[cfg(not(target_family = "wasm"))]
+mod escalation;
 pub mod sim;
 pub use nanocode_code_mode::CodeModeToolObservation;
 pub use pins::TextPins;
+#[cfg(not(target_family = "wasm"))]
+pub use escalation::ESCALATION_INPUTS;
 pub use policy::{CodeModeToolPolicy, FileAccess, WorkspaceToolRouting};
 #[cfg(not(target_family = "wasm"))]
 pub use selection::{AttachTarget, RemoteRunnerTools};
