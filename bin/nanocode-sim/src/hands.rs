@@ -125,10 +125,11 @@ pub enum HandsMutation {
     ReopenUnprobed,
     CancelLate,
     ReplyOverwrites,
+    AcceptorDropsSelection,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 21] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
@@ -149,6 +150,7 @@ impl HandsMutation {
         Self::ReopenUnprobed,
         Self::CancelLate,
         Self::ReplyOverwrites,
+        Self::AcceptorDropsSelection,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -179,6 +181,7 @@ impl HandsMutation {
             Self::ReopenUnprobed => "reopen_unprobed",
             Self::CancelLate => "cancel_late",
             Self::ReplyOverwrites => "reply_overwrites",
+            Self::AcceptorDropsSelection => "acceptor_drops_selection",
         }
     }
 
@@ -1087,6 +1090,7 @@ struct World {
     marks: RefCell<Marks>,
     wrong: RefCell<Vec<String>>,
     stats: RefCell<HandsStats>,
+    selects: bool,
 }
 
 impl World {
@@ -1438,7 +1442,7 @@ impl World {
             } else {
                 format!("runtime-{}", slot.hand.borrow().runtime)
             };
-            let catalog = json!({"type": "catalog", "definitions": [], "runtime_id": runtime, "resumable": true});
+            let catalog = json!({"type": "catalog", "definitions": [], "runtime_id": runtime, "resumable": true, "tool_selection": self.selects});
             let catalog = RemoteCatalog::decode(&catalog.to_string(), FRAME_BYTES_MAX)
                 .expect("the simulated catalog decodes");
             let (to_brain, from_hand) = mpsc::unbounded_channel();
@@ -1591,6 +1595,19 @@ impl World {
                 } else {
                     route.call_after(operation, Arc::clone(barrier)).await
                 };
+                if result.is_ok()
+                    && acceptor.connected(KEY)
+                    && route.supports_tool_selection() != self.selects
+                {
+                    self.fail(
+                        "tool_selection",
+                        format!(
+                            "call {index} reached a hand whose catalog says tool_selection={}, but its route says {}",
+                            self.selects,
+                            route.supports_tool_selection()
+                        ),
+                    );
+                }
                 let outcome = match result {
                     Ok(value) => Outcome::Value(value),
                     Err(error) if error.is_unsent() => Outcome::NotDispatched,
@@ -1928,6 +1945,11 @@ pub struct HandsOutcome {
 }
 
 fn simulate(seed: u64, mutation: HandsMutation, options: HandsOptions) -> HandsOutcome {
+    nanocode_tool_runtime::sim::mutate(if mutation == HandsMutation::AcceptorDropsSelection {
+        nanocode_tool_runtime::sim::Mutation::AcceptorDropsSelection
+    } else {
+        nanocode_tool_runtime::sim::Mutation::None
+    });
     let options = mutation.options(options);
     let mut script = Script::of(seed, options);
     let mut rng = Rng::derive(seed, "hands aim");
@@ -2092,6 +2114,7 @@ fn play(
         store,
         calls: RefCell::new(calls),
         rng: RefCell::new(Rng::derive(seed, "hands world")),
+        selects: Rng::derive(seed, "hands tool selection").below(2) == 0,
         clock: Arc::clone(&clock),
         trace: RefCell::new(Vec::new()),
         marks: RefCell::new(Marks::default()),

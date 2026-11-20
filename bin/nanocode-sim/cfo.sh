@@ -166,6 +166,7 @@ default_table='
 1 canary_hands_ack_before_store canary:100 --scenario hands --mutation ack_before_store
 1 canary_hands_skip_record canary:200 --scenario hands --mutation skip_record
 1 canary_hands_forget_pending canary:200 --scenario hands --mutation forget_pending
+1 canary_hands_acceptor_drops_selection canary:8 --scenario hands --mutation acceptor_drops_selection
 1 canary_hands_cross_replies canary:200 --scenario hands --mutation cross_replies
 1 canary_hands_mangle_runtime canary:200 --scenario hands --mutation mangle_runtime
 1 canary_hands_reply_overwrites canary:40 --scenario hands --mutation reply_overwrites

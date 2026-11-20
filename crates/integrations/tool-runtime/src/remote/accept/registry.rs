@@ -167,7 +167,11 @@ impl Redial {
     }
 }
 
-struct Shared(Arc<Redial>, bool);
+struct Shared {
+    redial: Arc<Redial>,
+    caches_local_tools: bool,
+    tool_selection: bool,
+}
 
 impl RemoteLink for Shared {
     fn send(
@@ -175,7 +179,7 @@ impl RemoteLink for Shared {
         frames: Vec<RemoteFrame>,
         delivery: RemoteDelivery,
     ) -> HostFuture<'_, Result<(), CodeModeHostError>> {
-        Box::pin(self.0.send(
+        Box::pin(self.redial.send(
             frames.into_iter().map(|frame| (frame, None)).collect(),
             delivery,
         ))
@@ -186,11 +190,11 @@ impl RemoteLink for Shared {
         frames: Vec<(RemoteFrame, Option<String>)>,
         delivery: RemoteDelivery,
     ) -> HostFuture<'_, Result<(), CodeModeHostError>> {
-        Box::pin(self.0.send(frames, delivery))
+        Box::pin(self.redial.send(frames, delivery))
     }
 
     fn receive(&self) -> HostFuture<'_, Result<Vec<RemoteFrame>, CodeModeHostError>> {
-        Box::pin(self.0.receive())
+        Box::pin(self.redial.receive())
     }
 
     fn close<'a>(&'a self, _: &'a str) -> HostFuture<'a, ()> {
@@ -198,17 +202,22 @@ impl RemoteLink for Shared {
     }
 
     fn max_frame_bytes(&self) -> Option<usize> {
-        self.0
+        self.redial
             .current()
             .and_then(|wire| wire.link.max_frame_bytes())
     }
 
     fn resumes(&self) -> Option<String> {
-        self.0.current().and_then(|wire| wire.link.resumes())
+        self.redial.current().and_then(|wire| wire.link.resumes())
     }
 
     fn caches_local_tools(&self) -> bool {
-        self.1
+        self.caches_local_tools
+    }
+
+    fn supports_tool_selection(&self) -> bool {
+        self.tool_selection
+            && !nanocode_tool_host::sim::mutated(nanocode_tool_host::sim::Mutation::AcceptorDropsSelection)
     }
 }
 
@@ -594,7 +603,11 @@ impl Acceptor {
             changes: Arc::clone(&self.changes),
         };
         let (client, driver, resumed) = RemoteClient::durable(
-            Shared(Arc::clone(&redial), catalog.caches_local_tools),
+            Shared {
+                redial: Arc::clone(&redial),
+                caches_local_tools: catalog.caches_local_tools,
+                tool_selection: catalog.tool_selection,
+            },
             self.options.operation_timeout,
             pending,
             Arc::new(ledger),
