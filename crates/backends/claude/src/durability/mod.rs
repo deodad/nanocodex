@@ -484,6 +484,14 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         })
     }
 
+    fn carry_steers(
+        &self,
+        id: String,
+        steers: Vec<(String, String, String)>,
+    ) -> PolicyFuture<'_, Vec<Option<(u32, u32)>>> {
+        Box::pin(async move { self.get().await?.carry_steers(id, steers).await })
+    }
+
     fn retained_steers(&self, id: String) -> PolicyFuture<'_, Vec<ClaudeSteer>> {
         Box::pin(async move { self.get().await?.retained_steers(id).await })
     }
@@ -912,6 +920,29 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 None => self.owner.accept_steer(id, after, &input, None).await,
             }
             .map_err(agent_error)
+        })
+    }
+    fn carry_steers(
+        &self,
+        id: String,
+        steers: Vec<(String, String, String)>,
+    ) -> PolicyFuture<'_, Vec<Option<(u32, u32)>>> {
+        Box::pin(async move {
+            let raw = |json: &str| {
+                serde_json::from_str::<Box<RawValue>>(json).map_err(|error| {
+                    nanocode_agent_core::NanocodeError::InvalidRequest(error.to_string())
+                })
+            };
+            let steers = steers
+                .iter()
+                .map(|(message_id, identity_json, input_json)| {
+                    Ok((message_id.clone(), raw(identity_json)?, raw(input_json)?))
+                })
+                .collect::<nanocode_agent_core::Result<Vec<_>>>()?;
+            self.owner
+                .carry_steers(id, &steers)
+                .await
+                .map_err(agent_error)
         })
     }
     fn retained_steers(&self, id: String) -> PolicyFuture<'_, Vec<ClaudeSteer>> {

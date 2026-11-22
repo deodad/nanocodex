@@ -57,7 +57,11 @@ pub fn agent_store_error(error: StoreError) -> NanocodeError {
 pub fn agent_error(error: Error) -> NanocodeError {
     if matches!(
         error,
-        Error::SteerConflict { .. } | Error::SteerWithdrawn { .. } | Error::SessionExists { .. }
+        Error::SteerConflict { .. }
+            | Error::SteerWithdrawn { .. }
+            | Error::SteerUnknown { .. }
+            | Error::SteerRangeExhausted { .. }
+            | Error::SessionExists { .. }
     ) {
         return NanocodeError::InvalidRequest(error.to_string());
     }

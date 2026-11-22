@@ -374,6 +374,12 @@ enum Command {
         identity: Option<EncodedPayload>,
         result: oneshot::Sender<Result<Option<u32>>>,
     },
+    CarrySteers {
+        caller: Caller,
+        operation_id: String,
+        steers: Vec<(String, EncodedPayload, EncodedPayload)>,
+        result: oneshot::Sender<Result<Vec<Option<(u32, u32)>>>>,
+    },
     IdentifiedSteerAccepted {
         caller: Caller,
         message_id: String,
@@ -524,6 +530,7 @@ impl Command {
             Self::Admit { result, .. } => drop(result.send(Err(error))),
             Self::AdmitAutomatic { result, .. } => drop(result.send(Err(error))),
             Self::AcceptSteer { result, .. } => drop(result.send(Err(error))),
+            Self::CarrySteers { result, .. } => drop(result.send(Err(error))),
             Self::IdentifiedSteerAccepted { result, .. } => drop(result.send(Err(error))),
             Self::UnfinishedOperation { result, .. } => drop(result.send(Err(error))),
             Self::SteerReceipt { result, .. } => drop(result.send(Err(error))),
@@ -1076,6 +1083,18 @@ impl Driver {
                 };
                 drop(result.send(outcome));
             }
+            Command::CarrySteers {
+                caller,
+                operation_id,
+                steers,
+                result,
+            } => {
+                let outcome = match self.authorize(&caller) {
+                    Ok(()) => self.carry_steers(&caller, operation_id, steers).await,
+                    Err(error) => Err(error),
+                };
+                drop(result.send(outcome));
+            }
             Command::IdentifiedSteerAccepted {
                 caller,
                 message_id,
@@ -1458,6 +1477,7 @@ impl Driver {
             | Command::WithdrawSteer { operation_id, .. } => operation_id,
             Command::Abandonable { .. }
             | Command::DiscardUnused { .. }
+            | Command::CarrySteers { .. }
             | Command::IdentifiedSteerAccepted { .. }
             | Command::PruneReceipts { .. }
             | Command::State { .. }
@@ -1953,6 +1973,117 @@ impl Driver {
         })
         .await?;
         Ok(Some(steer_index))
+    }
+
+    fn carried(
+        &self,
+        operation_id: &str,
+        message_id: &str,
+        identity: &EncodedPayload,
+    ) -> Result<bool> {
+        let mut known = false;
+        for (id, operation) in self.state.operations().iter() {
+            let Some(receipt) = operation.steer_receipts.get(message_id) else {
+                continue;
+            };
+            if !identity.matches_key(&receipt.input_key) {
+                return Err(Error::SteerConflict {
+                    message_id: message_id.to_owned(),
+                });
+            }
+            if *id == operation_id {
+                if receipt.withdrawn {
+                    return Err(Error::SteerWithdrawn {
+                        message_id: message_id.to_owned(),
+                    });
+                }
+                return Ok(false);
+            }
+            if operation.steer_read(message_id)
+                && !crate::sim::mutated(crate::sim::Mutation::CarryIgnoresEarlierRead)
+            {
+                return Ok(false);
+            }
+            known = true;
+        }
+        if !known
+            && !self.state.receipts_complete()
+            && !crate::sim::mutated(crate::sim::Mutation::CarryIgnoresPrunedReceipts)
+        {
+            return Err(Error::SteerUnknown {
+                message_id: message_id.to_owned(),
+            });
+        }
+        Ok(true)
+    }
+
+    async fn carry_steers(
+        &mut self,
+        caller: &Caller,
+        operation_id: String,
+        steers: Vec<(String, EncodedPayload, EncodedPayload)>,
+    ) -> Result<Vec<Option<(u32, u32)>>> {
+        self.require_claimed(caller, &operation_id)?;
+        self.require_running(&operation_id)?;
+        let operation = self.state.operation(&operation_id).ok_or_else(|| {
+            Error::InvalidState(format!("operation `{operation_id}` was not accepted"))
+        })?;
+        let boundary = operation.model_calls_started();
+        let held = u32::try_from(operation.steers.len())
+            .ok()
+            .and_then(|length| length.checked_add(operation.retired_steers));
+        if held
+            .zip(u32::try_from(steers.len()).ok())
+            .and_then(|(held, carried)| held.checked_add(carried))
+            .is_none()
+        {
+            return Err(Error::SteerRangeExhausted { operation_id });
+        }
+        let mut accepted = Vec::with_capacity(steers.len());
+        for (message_id, _, identity) in &steers {
+            accepted.push(self.carried(&operation_id, message_id, identity)?);
+        }
+        if !accepted.contains(&true) {
+            return Ok(vec![None; steers.len()]);
+        }
+        let revision = self.state.revision().checked_add(1).ok_or_else(|| {
+            Error::InvalidState("state revision exceeded the u64 range".to_owned())
+        })?;
+        let base = self.state.clone();
+        self.batch = Some(revision);
+        let mut outcome = Ok(());
+        let mut carried = Vec::with_capacity(steers.len());
+        for ((message_id, input, identity), accept) in steers.into_iter().zip(accepted) {
+            if !accept {
+                carried.push(None);
+                continue;
+            }
+            match self
+                .accept_steer(
+                    caller,
+                    operation_id.clone(),
+                    boundary,
+                    input,
+                    Some(message_id),
+                    Some(identity),
+                )
+                .await
+            {
+                Ok(index) => carried.push(index.map(|index| (index, boundary))),
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        self.batch = None;
+        let mut next = std::mem::replace(&mut self.state, base);
+        outcome?;
+        if let Some(limit) = self.terminal_receipt_limit {
+            let _ = next.retain_terminal_receipts(limit);
+        }
+        self.persist(next).await?;
+        Ok(carried)
     }
 
     fn retained_steers(&self, caller: &Caller, operation_id: &str) -> Result<Vec<StoredSteer>> {
@@ -3969,6 +4100,32 @@ impl DurableOwner {
             accepted_after_model_call_index,
             input: EncodedPayload::encode(input)?,
             identity: Some(EncodedPayload::encode(identity)?),
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn carry_steers<K: Serialize, I: Serialize>(
+        &self,
+        operation_id: String,
+        steers: &[(String, K, I)],
+    ) -> Result<Vec<Option<(u32, u32)>>> {
+        let steers = steers
+            .iter()
+            .map(|(message_id, identity, input)| {
+                Ok((
+                    message_id.clone(),
+                    EncodedPayload::encode(input)?,
+                    EncodedPayload::encode(identity)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CarrySteers {
+            caller: self.caller()?,
+            operation_id,
+            steers,
             result,
         })
         .await?;

@@ -11,6 +11,8 @@ pub enum Mutation {
     SubagentJournalKeepsRevision,
     /// The cell journals keep their cached head after a failed write.
     CellJournalKeepsHead,
+    CarryIgnoresEarlierRead,
+    CarryIgnoresPrunedReceipts,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

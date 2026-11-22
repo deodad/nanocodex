@@ -480,6 +480,26 @@ impl ExecutionPolicy for DurableExecution {
         })
     }
 
+    fn carry_steers<'a>(
+        &'a self,
+        operation_id: String,
+        steers: Vec<(String, String)>,
+    ) -> ExecutionFuture<'a, AgentResult<Vec<Option<(u32, u32)>>>> {
+        Box::pin(async move {
+            let steers = steers
+                .into_iter()
+                .map(|(message_id, input_json)| {
+                    let input = raw(input_json)?;
+                    Ok((message_id, input.clone(), input))
+                })
+                .collect::<AgentResult<Vec<_>>>()?;
+            self.owner
+                .carry_steers(operation_id, &steers)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
     fn accept_identified_steer<'a>(
         &'a self,
         operation_id: String,
@@ -1188,6 +1208,14 @@ impl ExecutionPolicy for LazyExecution {
                 )
                 .await
         })
+    }
+
+    fn carry_steers<'a>(
+        &'a self,
+        operation_id: String,
+        steers: Vec<(String, String)>,
+    ) -> ExecutionFuture<'a, AgentResult<Vec<Option<(u32, u32)>>>> {
+        Box::pin(async move { self.get().await?.carry_steers(operation_id, steers).await })
     }
 
     fn retained_steers<'a>(
