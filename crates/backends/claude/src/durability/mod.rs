@@ -484,19 +484,12 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         })
     }
 
-    fn carry_steer(
+    fn carry_steers(
         &self,
         id: String,
-        message_id: String,
-        identity_json: String,
-        input_json: String,
-    ) -> PolicyFuture<'_, Option<(u32, u32)>> {
-        Box::pin(async move {
-            self.get()
-                .await?
-                .carry_steer(id, message_id, identity_json, input_json)
-                .await
-        })
+        steers: Vec<(String, String, String)>,
+    ) -> PolicyFuture<'_, Vec<Option<(u32, u32)>>> {
+        Box::pin(async move { self.get().await?.carry_steers(id, steers).await })
     }
 
     fn retained_steers(&self, id: String) -> PolicyFuture<'_, Vec<ClaudeSteer>> {
@@ -929,21 +922,25 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             .map_err(agent_error)
         })
     }
-    fn carry_steer(
+    fn carry_steers(
         &self,
         id: String,
-        message_id: String,
-        identity_json: String,
-        input_json: String,
-    ) -> PolicyFuture<'_, Option<(u32, u32)>> {
+        steers: Vec<(String, String, String)>,
+    ) -> PolicyFuture<'_, Vec<Option<(u32, u32)>>> {
         Box::pin(async move {
             let raw = |json: &str| {
                 serde_json::from_str::<Box<RawValue>>(json).map_err(|error| {
                     nanocode_agent_core::NanocodeError::InvalidRequest(error.to_string())
                 })
             };
+            let steers = steers
+                .iter()
+                .map(|(message_id, identity_json, input_json)| {
+                    Ok((message_id.clone(), raw(identity_json)?, raw(input_json)?))
+                })
+                .collect::<nanocode_agent_core::Result<Vec<_>>>()?;
             self.owner
-                .carry_steer(id, message_id, &raw(&identity_json)?, &raw(&input_json)?)
+                .carry_steers(id, &steers)
                 .await
                 .map_err(agent_error)
         })

@@ -150,16 +150,14 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
             ))
         })
     }
-    fn carry_steer(
+    fn carry_steers(
         &self,
         _id: String,
-        _message_id: String,
-        _identity_json: String,
-        _input_json: String,
-    ) -> PolicyFuture<'_, Option<(u32, u32)>> {
+        _steers: Vec<(String, String, String)>,
+    ) -> PolicyFuture<'_, Vec<Option<(u32, u32)>>> {
         Box::pin(async {
             Err(NanocodeError::InvalidRequest(
-                "Claude execution policy does not support carry_steer".into(),
+                "Claude execution policy does not support carry_steers".into(),
             ))
         })
     }

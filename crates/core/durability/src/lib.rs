@@ -47,6 +47,10 @@ pub enum Error {
         message_id: String,
     },
 
+    SteerRangeExhausted {
+        operation_id: String,
+    },
+
     Store(StoreError),
 
     Decode {
@@ -136,6 +140,10 @@ impl std::fmt::Display for Error {
             Self::SteerUnknown { message_id } => write!(
                 formatter,
                 "steering message `{message_id}` cannot be carried: the session pruned receipts that may hold it"
+            ),
+            Self::SteerRangeExhausted { operation_id } => write!(
+                formatter,
+                "carried steers would exceed operation `{operation_id}`'s steer counter range"
             ),
             Self::Store(value) => std::fmt::Display::fmt(value, formatter),
             Self::Decode { revision, source } => write!(

@@ -60,6 +60,7 @@ pub fn agent_error(error: Error) -> NanocodeError {
         Error::SteerConflict { .. }
             | Error::SteerWithdrawn { .. }
             | Error::SteerUnknown { .. }
+            | Error::SteerRangeExhausted { .. }
             | Error::SessionExists { .. }
     ) {
         return NanocodeError::InvalidRequest(error.to_string());

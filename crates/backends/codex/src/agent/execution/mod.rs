@@ -221,15 +221,14 @@ pub trait ExecutionPolicy: Send + Sync {
         })
     }
 
-    fn carry_steer<'a>(
+    fn carry_steers<'a>(
         &'a self,
         _operation_id: String,
-        _message_id: String,
-        _input_json: String,
-    ) -> ExecutionFuture<'a, Result<Option<(u32, u32)>>> {
+        _steers: Vec<(String, String)>,
+    ) -> ExecutionFuture<'a, Result<Vec<Option<(u32, u32)>>>> {
         Box::pin(async {
             Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
-                capability: "carry_steer",
+                capability: "carry_steers",
             })
         })
     }
@@ -1143,18 +1142,26 @@ impl ExecutionTurn {
         let mut accepted = Vec::new();
         if let (Some(policy), Some(operation_id)) = (&self.policy, &self.operation_id) {
             policy.begin_attempt(operation_id.clone()).await?;
-            for (id, prompt) in carried {
-                if policy
-                    .carry_steer(operation_id.clone(), id.clone(), encode(prompt)?)
-                    .await?
-                    .is_some()
-                {
-                    accepted.push(id.clone());
+            if !carried.is_empty() {
+                let steers = carried
+                    .iter()
+                    .map(|(id, prompt)| Ok((id.clone(), encode(prompt)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let carried_now = policy.carry_steers(operation_id.clone(), steers).await?;
+                assert_eq!(
+                    carried_now.len(),
+                    carried.len(),
+                    "the store answers every carried steer"
+                );
+                for ((id, _), now) in carried.iter().zip(carried_now) {
+                    if now.is_some() {
+                        accepted.push(id.clone());
+                    }
                 }
             }
         } else if !carried.is_empty() {
             return Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
-                capability: "carry_steer",
+                capability: "carry_steers",
             });
         }
         Ok((self.retained_steers().await?, accepted))

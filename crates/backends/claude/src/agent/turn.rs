@@ -520,56 +520,68 @@ pub(super) fn summarize_locked<'a>(
     })
 }
 
-pub(super) fn carry_steer<'a>(
+pub(super) fn carry_steers<'a>(
     state: &'a State,
     turn: &'a mut TurnSteering,
     policy: &'a dyn ClaudeExecutionPolicy,
     operation: &'a str,
-    id: &'a str,
-    prompt: &'a Prompt,
+    carried: &'a [(String, Prompt)],
 ) -> AgentFuture<'a, Result<()>> {
     Box::pin(async move {
-        let input_json = serde_json::to_string(prompt).map_err(provider_error)?;
-        let frozen = crate::prompt::freeze(prompt.clone(), turn.images, &state.images).await?;
-        let journaled = serde_json::to_string(&frozen).map_err(provider_error)?;
-        let Some((index, after)) = policy
-            .carry_steer(
-                operation.to_owned(),
-                id.to_owned(),
-                input_json.clone(),
-                journaled,
-            )
-            .await?
-        else {
+        if carried.is_empty() {
             return Ok(());
-        };
-        turn.next_index = turn.next_index.max(index);
-        turn.receipts.insert(id.to_owned(), (input_json, false));
+        }
+        let mut frozen = Vec::with_capacity(carried.len());
+        let mut steers = Vec::with_capacity(carried.len());
+        for (id, prompt) in carried {
+            let input_json = serde_json::to_string(prompt).map_err(provider_error)?;
+            let prompt = crate::prompt::freeze(prompt.clone(), turn.images, &state.images).await?;
+            let journaled = serde_json::to_string(&prompt).map_err(provider_error)?;
+            steers.push((id.clone(), input_json, journaled));
+            frozen.push(prompt);
+        }
+        let accepted = policy
+            .carry_steers(operation.to_owned(), steers.clone())
+            .await?;
+        assert_eq!(
+            accepted.len(),
+            carried.len(),
+            "the store answers every carried steer"
+        );
         let turn_id = turn
             .events
             .turn_id()
             .unwrap_or(turn.events.request_id())
             .to_owned();
-        State::publish(
-            &turn.events,
-            AgentEventKind::InputAccepted,
-            &event::InputAccepted {
-                session_id: &state.session_id,
-                turn_id: &turn_id,
-                item_id: format!("{turn_id}:steer:{id}"),
-                kind: "steer",
-                request_id: Some(id),
-                input: &frozen.instruction,
-            },
-        );
-        turn.pending.push_back(PendingSteer {
-            prompt: frozen,
-            message_id: Some(id.to_owned()),
-            index,
-            after,
-            boundary: None,
-            durable: true,
-        });
+        for (((id, input_json, _), prompt), accepted) in
+            steers.into_iter().zip(frozen).zip(accepted)
+        {
+            let Some((index, after)) = accepted else {
+                continue;
+            };
+            turn.next_index = turn.next_index.max(index);
+            turn.receipts.insert(id.clone(), (input_json, false));
+            State::publish(
+                &turn.events,
+                AgentEventKind::InputAccepted,
+                &event::InputAccepted {
+                    session_id: &state.session_id,
+                    turn_id: &turn_id,
+                    item_id: format!("{turn_id}:steer:{id}"),
+                    kind: "steer",
+                    request_id: Some(&id),
+                    input: &prompt.instruction,
+                },
+            );
+            turn.pending.push_back(PendingSteer {
+                prompt,
+                message_id: Some(id),
+                index,
+                after,
+                boundary: None,
+                durable: true,
+            });
+        }
         Ok(())
     })
 }

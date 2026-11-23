@@ -48,10 +48,17 @@ const EPOCHS_MAX: u64 = 4;
 pub enum CarryMutation {
     None,
     CarryAsText,
+    IgnoresEarlierRead,
+    IgnoresPrunedReceipts,
 }
 
 impl CarryMutation {
-    const ALL: [Self; 2] = [Self::None, Self::CarryAsText];
+    const ALL: [Self; 4] = [
+        Self::None,
+        Self::CarryAsText,
+        Self::IgnoresEarlierRead,
+        Self::IgnoresPrunedReceipts,
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
@@ -63,6 +70,18 @@ impl CarryMutation {
         match self {
             Self::None => "none",
             Self::CarryAsText => "carry_steer_as_text",
+            Self::IgnoresEarlierRead => "carry_ignores_earlier_read",
+            Self::IgnoresPrunedReceipts => "carry_ignores_pruned_receipts",
+        }
+    }
+
+    const fn durability(self) -> nanocode_durability::sim::Mutation {
+        match self {
+            Self::IgnoresEarlierRead => nanocode_durability::sim::Mutation::CarryIgnoresEarlierRead,
+            Self::IgnoresPrunedReceipts => {
+                nanocode_durability::sim::Mutation::CarryIgnoresPrunedReceipts
+            }
+            Self::None | Self::CarryAsText => nanocode_durability::sim::Mutation::None,
         }
     }
 
@@ -427,6 +446,9 @@ async fn carry_turn(
         CarryMutation::None => {
             PromptRequest::new("NEXTTURN continue").carry_steer(STEER_ID, Prompt::new(STEER_TEXT))
         }
+        CarryMutation::IgnoresEarlierRead | CarryMutation::IgnoresPrunedReceipts => {
+            PromptRequest::new("NEXTTURN continue").carry_steer(STEER_ID, Prompt::new(STEER_TEXT))
+        }
         CarryMutation::CarryAsText => {
             PromptRequest::new(format!("NEXTTURN continue\n{STEER_TEXT}"))
         }
@@ -739,6 +761,7 @@ struct Outcome {
 }
 
 fn simulate(seed: u64, mutation: CarryMutation) -> Outcome {
+    nanocode_durability::sim::mutate(mutation.durability());
     let mut stats = CarryStats {
         seeds: 1,
         ..CarryStats::default()
